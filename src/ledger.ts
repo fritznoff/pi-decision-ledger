@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { importDurableAdr } from "./durable.ts";
 
 export const TOOL_NAME = "decision_ledger";
 export const CUSTOM_ENTRY_TYPE = "pi-decision-ledger";
@@ -8,16 +9,24 @@ export const DECISION_EXPORT_MESSAGE_TYPE = "pi-decision-ledger-export";
 export const REVIEW_DRAFT_MESSAGE_TYPE = "pi-decision-ledger-review-draft";
 export const FOCUS_TRANSITION_MESSAGE_TYPE = "pi-decision-ledger-focus-transition";
 export const FOCUS_MARKER_MESSAGE_TYPE = "pi-decision-ledger-focus-marker";
+export const ADR_EDIT_MESSAGE_TYPE = "pi-decision-ledger-adr-edit";
 
-export const DECISION_COMMANDS = ["capture", "explore", "remove", "return", "exit"] as const;
-export const DECISIONS_COMMANDS = ["recover", "export"] as const;
+export const DECISION_COMMANDS = ["capture", "explore", "promote", "remove", "return", "exit"] as const;
+
+/** Subcommands that take decision IDs, and whether they take more than one. */
+export const DECISION_ID_COMMANDS: Record<string, "single" | "multiple"> = {
+	explore: "single",
+	promote: "multiple",
+	remove: "multiple",
+};
+export const DECISIONS_COMMANDS = ["new", "recover", "export"] as const;
 
 export const DECISION_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 export const DECISION_ID_LENGTH = 3;
 export const MAX_DECISION_ID_ATTEMPTS = 128;
 export const MAX_RANDOM_BYTE_ATTEMPTS = 128;
 
-export const LIFECYCLES = ["open", "exploring", "proposed", "resolved", "deferred", "ignored"] as const;
+export const LIFECYCLES = ["open", "proposed", "resolved", "deferred", "ignored"] as const;
 export type Lifecycle = (typeof LIFECYCLES)[number];
 
 /** Lifecycles that can be declared when an item is added. Exploration needs a live bookmark. */
@@ -37,8 +46,29 @@ export interface DecisionRecord {
 export interface Exploration {
 	returnEntryId: string;
 	returnLabel: string;
-	/** The state to restore when this exploration is explicitly exited. */
+	/** Legacy/audit metadata describing the lifecycle when focus began; exit never restores from it. */
 	origin: ExplorationOrigin;
+}
+
+/**
+ * Provenance for a session decision promoted to a repository ADR draft. The
+ * repository file is authoritative once this exists; everything held here is a
+ * working copy, frozen at promotion time.
+ */
+export interface DurablePromotion {
+	/** Durable ADR UUIDv4. */
+	adrId: string;
+	/** Stable repository-local human handle used by ADR commands. */
+	slug: string;
+	repositoryRoot: string;
+	relativePath: string;
+	lifecycle: "draft" | "accepted" | "superseded";
+	baseSemanticDigest: string;
+	baseSourceFingerprint: string;
+	/** Exact checked-out source used for optimistic conflict detection. */
+	baseSource: string;
+	/** Every session decision promoted into this ADR, in the order given. */
+	sourceDecisionIds: string[];
 }
 
 export interface DecisionItem {
@@ -51,6 +81,8 @@ export interface DecisionItem {
 	/** The exact Markdown draft for this item's lightweight or explored proposal. */
 	proposalMarkdown?: string;
 	exploration?: Exploration;
+	/** Stable identity of the registry-owned ADR associated with this decision. */
+	adrId?: string;
 }
 
 export interface DecisionLedger {
@@ -70,6 +102,8 @@ export interface DecisionProposal {
 export interface LedgerState {
 	ledger?: DecisionLedger;
 	proposal?: DecisionProposal;
+	/** First-class repository ADR working copies, independent of source decisions. */
+	adrs?: DurablePromotion[];
 }
 
 export interface AddDecisionItemInput {
@@ -93,15 +127,14 @@ export interface AddDecisionItemsOptions {
 
 export interface DecisionUpdateInput {
 	id: string;
+	title?: string;
 	point?: string;
-	lifecycle?: Lifecycle;
-	record?: DecisionRecord;
 }
 
 export interface LedgerSessionDetails {
 	extension: typeof CUSTOM_ENTRY_TYPE;
 	version: 1;
-	action: "list" | "detail" | "add" | "update" | "explore" | "propose" | "remove";
+	action: "list" | "detail" | "add" | "update" | "explore" | "propose" | "resolve" | "accept" | "reject" | "defer" | "ignore" | "reopen" | "remove" | "promote_adr";
 	state: LedgerState;
 	addedIds?: string[];
 	updatedIds?: string[];
@@ -113,7 +146,7 @@ export interface LedgerSessionDetails {
 export interface LedgerCustomEntryData {
 	extension: typeof CUSTOM_ENTRY_TYPE;
 	version: 1;
-	source: "command" | "recovery" | "fork_reset" | "navigation_rollback";
+	source: "command" | "recovery" | "fork_reset" | "navigation_rollback" | "session_handoff";
 	state: LedgerState;
 }
 
@@ -160,9 +193,26 @@ export function decisionDisplayTitle(item: Pick<DecisionItem, "title" | "point">
 	return item.title?.trim() || item.point;
 }
 
+/** Compact durable badge, kept separate from the session lifecycle. */
+export function durableBadge(item: Pick<DecisionItem, "adrId">, state: LedgerState): string | undefined {
+	const adr = state.adrs?.find((candidate) => candidate.adrId === item.adrId);
+	return adr === undefined ? undefined : `ADR ${adr.lifecycle}`;
+}
+
+function durableDetailLines(durable: DurablePromotion, bullet: string): string[] {
+	return [
+		`${bullet}ADR lifecycle: **${durable.lifecycle}** (the repository file is authoritative)`,
+		`${bullet}ADR slug: \`${durable.slug}\``,
+		`${bullet}ADR ID: \`${durable.adrId}\``,
+		`${bullet}ADR file: \`${durable.relativePath}\` in \`${durable.repositoryRoot}\``,
+		`${bullet}ADR sources: ${durable.sourceDecisionIds.map((id) => formatDecisionId(id)).join(", ")}`,
+	];
+}
+
 export interface DecisionStatePresentation {
 	symbol: "○" | "◉" | "◇" | "✓" | "⏸" | "−";
 	kind: Lifecycle;
+	focused: boolean;
 	ignored: boolean;
 	dimmed: boolean;
 	bold: boolean;
@@ -178,20 +228,18 @@ export function normalizeDecisionId(id: string): string {
 	return normalized;
 }
 
-export function decisionStatePresentation(item: Pick<DecisionItem, "lifecycle">): DecisionStatePresentation {
+export function decisionStatePresentation(item: Pick<DecisionItem, "lifecycle" | "exploration">): DecisionStatePresentation {
 	switch (item.lifecycle) {
 		case "open":
-			return { symbol: "○", kind: item.lifecycle, ignored: false, dimmed: false, bold: false };
-		case "exploring":
-			return { symbol: "◉", kind: item.lifecycle, ignored: false, dimmed: false, bold: true };
+			return { symbol: item.exploration === undefined ? "○" : "◉", kind: item.lifecycle, focused: item.exploration !== undefined, ignored: false, dimmed: false, bold: item.exploration !== undefined };
 		case "proposed":
-			return { symbol: "◇", kind: item.lifecycle, ignored: false, dimmed: false, bold: false };
+			return { symbol: item.exploration === undefined ? "◇" : "◉", kind: item.lifecycle, focused: item.exploration !== undefined, ignored: false, dimmed: false, bold: item.exploration !== undefined };
 		case "resolved":
-			return { symbol: "✓", kind: item.lifecycle, ignored: false, dimmed: true, bold: false };
+			return { symbol: "✓", kind: item.lifecycle, focused: false, ignored: false, dimmed: true, bold: false };
 		case "deferred":
-			return { symbol: "⏸", kind: item.lifecycle, ignored: false, dimmed: true, bold: false };
+			return { symbol: "⏸", kind: item.lifecycle, focused: false, ignored: false, dimmed: true, bold: false };
 		case "ignored":
-			return { symbol: "−", kind: item.lifecycle, ignored: true, dimmed: true, bold: false };
+			return { symbol: "−", kind: item.lifecycle, focused: false, ignored: true, dimmed: true, bold: false };
 	}
 }
 
@@ -204,7 +252,7 @@ export function isDecisionUnresolved(item: Pick<DecisionItem, "lifecycle">): boo
 }
 
 export function isDecisionActionable(item: Pick<DecisionItem, "lifecycle">): boolean {
-	return item.lifecycle === "open" || item.lifecycle === "exploring" || item.lifecycle === "proposed";
+	return item.lifecycle === "open" || item.lifecycle === "proposed";
 }
 
 export interface DecisionProgress {
@@ -237,7 +285,7 @@ export function orderDecisionItems<T extends Pick<DecisionItem, "lifecycle">>(it
  * separate from orderDecisionItems because /decisions must remain complete.
  */
 export function orderActionableDecisionItems<T extends Pick<DecisionItem, "lifecycle">>(items: readonly T[]): T[] {
-	const rank = (item: T): number => item.lifecycle === "open" ? 0 : item.lifecycle === "exploring" ? 1 : 2;
+	const rank = (item: T): number => item.lifecycle === "open" ? 0 : 1;
 	return items
 		.filter(isDecisionActionable)
 		.map((item, index) => ({ item, index }))
@@ -283,6 +331,7 @@ function cloneItem(item: DecisionItem): DecisionItem {
 		...(item.record === undefined ? {} : { record: cloneRecord(item.record) }),
 		...(item.proposalMarkdown === undefined ? {} : { proposalMarkdown: item.proposalMarkdown }),
 		...(item.exploration === undefined ? {} : { exploration: { ...item.exploration } }),
+		...(item.adrId === undefined ? {} : { adrId: item.adrId }),
 	};
 }
 
@@ -297,23 +346,24 @@ function cloneLedger(ledger: DecisionLedger): DecisionLedger {
 export function cloneState(state: LedgerState): LedgerState {
 	const clonedState: LedgerState = {
 		...(state.ledger === undefined ? {} : { ledger: cloneLedger(state.ledger) }),
-		...(state.proposal === undefined
-			? {}
-			: {
-					proposal: {
-						itemId: state.proposal.itemId,
-						record: cloneRecord(state.proposal.record),
-						markdown: state.proposal.markdown,
-					},
-				}),
 	};
-	if (clonedState.ledger !== undefined && clonedState.proposal !== undefined) {
+	if (state.adrs !== undefined) {
+		clonedState.adrs = state.adrs.map((adr) => ({ ...adr, sourceDecisionIds: [...adr.sourceDecisionIds] }));
+	}
+	if (clonedState.ledger !== undefined && state.proposal !== undefined) {
 		const proposalItem = clonedState.ledger.items.find(
-			(item) => item.id.toUpperCase() === clonedState.proposal!.itemId.toUpperCase(),
+			(item) => item.id.toUpperCase() === state.proposal!.itemId.toUpperCase(),
 		);
-		if (proposalItem !== undefined && proposalItem.proposalMarkdown === undefined) {
-			proposalItem.proposalMarkdown = clonedState.proposal.markdown;
+		if (proposalItem !== undefined) {
+			if (proposalItem.record === undefined) proposalItem.record = cloneRecord(state.proposal.record);
+			if (proposalItem.proposalMarkdown === undefined) proposalItem.proposalMarkdown = state.proposal.markdown;
 		}
+	}
+	for (const item of clonedState.ledger?.items ?? []) {
+		if ((item.lifecycle as string) !== "exploring") continue;
+		const origin = item.exploration?.origin;
+		item.lifecycle = origin === "proposed" ? "proposed" : "open";
+		if (item.exploration === undefined) item.lifecycle = "open";
 	}
 	return clonedState;
 }
@@ -394,20 +444,14 @@ export function generateDecisionId(
 	throw new Error(`could not allocate a unique decision ID after ${attempts} attempts`);
 }
 
-function isExplorationLifecycle(lifecycle: Lifecycle): boolean {
-	return lifecycle === "exploring" || lifecycle === "proposed";
-}
-
 export function getFocusedExploration(state: LedgerState): DecisionItem | undefined {
-	return state.ledger?.items.find(
-		(item) => item.exploration !== undefined && isExplorationLifecycle(item.lifecycle),
-	);
+	return state.ledger?.items.find((item) => item.exploration !== undefined);
 }
 
 /**
  * Resolve the proposal belonging to an item. The per-item Markdown is the
- * source of truth for new snapshots; the state-level proposal remains a
- * legacy fallback for snapshots written before proposals became per-item.
+ * source of truth for new snapshots; the state-level proposal is accepted only
+ * as a legacy fallback for snapshots written before proposals became per-item.
  */
 export function getDecisionProposal(state: LedgerState, id: string): DecisionProposal | undefined {
 	const normalizedId = normalizeDecisionId(id);
@@ -457,9 +501,12 @@ export function findNaturalLanguageExplorationReturnEntryId(
 	return precedingEntry !== undefined && typeof precedingEntry.id === "string" ? precedingEntry.id : undefined;
 }
 
+export const PROMOTE_REPOSITORY_FLAG = "--repo";
+export const PROMOTE_SLUG_FLAG = "--slug";
+
 export function completeDecisionCommandArguments(
 	argumentPrefix: string,
-	items: readonly (Pick<DecisionItem, "id" | "point"> & { title?: string })[],
+	items: readonly (Pick<DecisionItem, "id" | "point"> & { title?: string; adrId?: string })[],
 ): CompletionItem[] | null {
 	const firstSpace = argumentPrefix.indexOf(" ");
 	if (firstSpace < 0) {
@@ -474,17 +521,28 @@ export function completeDecisionCommandArguments(
 	}
 
 	const command = argumentPrefix.slice(0, firstSpace).toLowerCase();
-	if (command !== "explore" && command !== "remove") return null;
+	const arity = DECISION_ID_COMMANDS[command];
+	if (arity === undefined) return null;
 
 	const argumentText = argumentPrefix.slice(firstSpace + 1);
 	const tokens = argumentText.split(/\s+/);
 	const partialId = argumentText.endsWith(" ") ? "" : (tokens.pop() ?? "");
-	if (command === "explore" && tokens.some(Boolean)) return null;
+	if (arity === "single" && tokens.some(Boolean)) return null;
 	const selectedTokens = tokens.filter(Boolean);
+	// The repository path after --repo is free text, not a decision ID.
+	if (command === "promote" && selectedTokens.includes(PROMOTE_REPOSITORY_FLAG)) return null;
+	if (command === "promote" && partialId.startsWith("-")) {
+		if (selectedTokens.length === 0) return null;
+		return [
+			...(PROMOTE_SLUG_FLAG.startsWith(partialId) && !selectedTokens.includes(PROMOTE_SLUG_FLAG) ? [{ value: `${command} ${[...selectedTokens, PROMOTE_SLUG_FLAG].join(" ")} `, label: PROMOTE_SLUG_FLAG, description: "stable ADR slug" }] : []),
+			...(PROMOTE_REPOSITORY_FLAG.startsWith(partialId) && !selectedTokens.includes(PROMOTE_REPOSITORY_FLAG) ? [{ value: `${command} ${[...selectedTokens, PROMOTE_REPOSITORY_FLAG].join(" ")} `, label: PROMOTE_REPOSITORY_FLAG, description: "explicit Git repository root" }] : []),
+		];
+	}
 	const alreadySelected = new Set(selectedTokens.map((id) => id.toUpperCase()));
 	const idPrefix = partialId.toUpperCase();
 	const matches = items.filter(
-		(item) => !alreadySelected.has(item.id.toUpperCase()) && item.id.toUpperCase().startsWith(idPrefix),
+		(item) => !alreadySelected.has(item.id.toUpperCase()) && item.id.toUpperCase().startsWith(idPrefix) &&
+			(command === "promote" ? item.adrId === undefined : true),
 	);
 	return matches.length === 0
 		? null
@@ -589,87 +647,33 @@ export function addDecisionItems(
 }
 
 export function applyBatchUpdates(state: LedgerState, updates: readonly DecisionUpdateInput[]): LedgerState {
-	if (updates.length === 0) {
-		throw new Error("at least one update is required");
-	}
-
-	const currentLedger = state.ledger;
-	assertLedger(currentLedger);
-	const normalizedUpdates = updates.map((update) => ({ ...update, id: normalizeDecisionId(update.id) }));
+	if (updates.length === 0) throw new Error("at least one update is required");
+	const ledger = state.ledger;
+	assertLedger(ledger);
+	const normalized = updates.map((update) => ({ ...update, id: normalizeDecisionId(update.id) }));
 	const ids = new Set<string>();
-
-	for (const update of normalizedUpdates) {
+	for (const update of normalized) {
 		if (ids.has(update.id)) throw new Error(`duplicate update for ${formatDecisionId(update.id)}`);
 		ids.add(update.id);
-		const currentItem = findItem(currentLedger, update.id);
-		if (update.point === undefined && update.lifecycle === undefined && update.record === undefined) {
-			throw new Error(`${formatDecisionId(update.id)} has no fields to update`);
-		}
-		if (update.point !== undefined && !update.point.trim()) {
-			throw new Error(`${formatDecisionId(update.id)}.point must not be empty`);
-		}
-		if (update.record !== undefined) assertRecord(update.record);
-		if (update.lifecycle === "exploring") {
-			throw new Error(`${formatDecisionId(update.id)} must be started with /decision explore`);
-		}
-		if (update.lifecycle === "proposed") {
-			throw new Error(`${formatDecisionId(update.id)} must be proposed with decision_ledger propose`);
-		}
-
-		const activelyExplored = currentItem.exploration !== undefined && isExplorationLifecycle(currentItem.lifecycle);
-		const nextLifecycle = update.lifecycle ?? currentItem.lifecycle;
-		if (activelyExplored && update.lifecycle !== undefined && nextLifecycle !== currentItem.lifecycle) {
-			throw new Error(`${formatDecisionId(update.id)} must be finalized with /decision return or left with /decision exit while it is being explored`);
-		}
-		if (currentItem.lifecycle === "proposed" && !activelyExplored && update.lifecycle !== undefined) {
-			if (nextLifecycle !== "open" && nextLifecycle !== "resolved" && nextLifecycle !== "deferred" && nextLifecycle !== "ignored") {
-				throw new Error(`${formatDecisionId(update.id)} lightweight proposal cannot transition to ${nextLifecycle}`);
-			}
-			if (nextLifecycle === "resolved" && update.record === undefined && currentItem.record === undefined) {
-				throw new Error(`${formatDecisionId(update.id)} cannot be accepted without a complete record`);
-			}
-		}
-		if ((currentItem.lifecycle === "resolved" || currentItem.lifecycle === "ignored" || currentItem.lifecycle === "deferred") && update.lifecycle !== undefined) {
-			if (nextLifecycle !== currentItem.lifecycle && nextLifecycle !== "open") {
-				throw new Error(`${formatDecisionId(update.id)} is terminal; reopen it to open before changing its outcome`);
-			}
-		}
-		if (isExplorationLifecycle(nextLifecycle) && currentItem.exploration === undefined) {
-			throw new Error(`${formatDecisionId(update.id)} must be started with /decision explore`);
-		}
+		const item = findItem(ledger, update.id);
+		const extra = update as unknown as Record<string, unknown>;
+		if ("lifecycle" in extra || "record" in extra) throw new Error(`${formatDecisionId(update.id)} update may change only title and point`);
+		if (update.title === undefined && update.point === undefined) throw new Error(`${formatDecisionId(update.id)} has no fields to update`);
+		if (update.title !== undefined && !update.title.trim()) throw new Error(`${formatDecisionId(update.id)}.title must not be empty`);
+		if (update.point !== undefined && !update.point.trim()) throw new Error(`${formatDecisionId(update.id)}.point must not be empty`);
+		void item;
 	}
-
 	const nextState = cloneState(state);
 	const nextLedger = nextState.ledger;
 	assertLedger(nextLedger);
-
-	for (const update of normalizedUpdates) {
+	for (const update of normalized) {
 		const item = findItem(nextLedger, update.id);
-		const wasLightweightProposal = item.lifecycle === "proposed" && item.exploration === undefined;
-		const nextLifecycle = update.lifecycle ?? item.lifecycle;
+		if (update.title !== undefined) item.title = update.title.trim();
 		if (update.point !== undefined) item.point = update.point.trim();
-		if (update.lifecycle !== undefined) item.lifecycle = update.lifecycle;
-		if (update.record !== undefined) item.record = cloneRecord(update.record);
-		if (wasLightweightProposal && nextLifecycle === "open") item.record = undefined;
-		if (!isExplorationLifecycle(nextLifecycle)) item.exploration = undefined;
-		if (
-			wasLightweightProposal &&
-			(update.lifecycle === "open" || update.lifecycle === "resolved" || update.lifecycle === "deferred" || update.lifecycle === "ignored")
-		) {
-			item.proposalMarkdown = undefined;
-		}
-		if (
-			nextState.proposal?.itemId.toUpperCase() === update.id &&
-			(update.lifecycle === "open" || update.lifecycle === "resolved" || update.lifecycle === "deferred" || update.lifecycle === "ignored")
-		) {
-			nextState.proposal = undefined;
+		if (item.lifecycle === "proposed" && item.record !== undefined) {
+			item.proposalMarkdown = renderDecisionRecordMarkdown(item, item.record);
 		}
 	}
-
-	const focused = nextLedger.items.filter(
-		(item) => item.exploration !== undefined && isExplorationLifecycle(item.lifecycle),
-	);
-	if (focused.length > 1) throw new Error("only one active exploration is allowed");
 	return nextState;
 }
 
@@ -684,7 +688,7 @@ export function removeDecisionItems(state: LedgerState, ids: readonly string[]):
 		if (uniqueIds.has(id)) throw new Error(`duplicate removal for ${formatDecisionId(id)}`);
 		uniqueIds.add(id);
 		const item = findItem(currentLedger, id);
-		if (item.exploration !== undefined && isExplorationLifecycle(item.lifecycle)) {
+		if (item.exploration !== undefined) {
 			throw new Error(`${formatDecisionId(id)} is actively explored and cannot be removed`);
 		}
 	}
@@ -700,7 +704,7 @@ export function removeDecisionItems(state: LedgerState, ids: readonly string[]):
 	return nextState;
 }
 
-export type DecisionAction = "explore" | "accept" | "ignore" | "reopen" | "defer" | "remove";
+export type DecisionAction = "explore" | "resolve" | "accept" | "reject" | "ignore" | "reopen" | "defer" | "remove";
 
 export function decisionActionReason(state: LedgerState, id: string, action: DecisionAction): string | undefined {
 	try {
@@ -708,23 +712,28 @@ export function decisionActionReason(state: LedgerState, id: string, action: Dec
 		assertLedger(ledger);
 		const item = findItem(ledger, id);
 		const displayId = formatDecisionId(item.id);
-		const active = item.exploration !== undefined && isExplorationLifecycle(item.lifecycle);
+		const active = item.exploration !== undefined;
 		switch (action) {
 			case "explore":
 				if (active) return `${displayId} is already being explored`;
-				if (item.lifecycle === "open" || (item.lifecycle === "proposed" && item.exploration === undefined)) return undefined;
+				if (item.lifecycle === "open" || item.lifecycle === "proposed") return undefined;
 				return `${displayId} cannot be explored from ${item.lifecycle}; reopen it first if needed`;
+			case "resolve":
+				if (active) return `${displayId} is actively explored; use /decision return or /decision exit first`;
+				if (item.lifecycle !== "open") return `${displayId} can only be directly resolved from open`;
+				return undefined;
 			case "accept":
-				if (item.lifecycle !== "proposed" && item.lifecycle !== "exploring") return `${displayId} has no proposal to accept`;
-				if (item.exploration !== undefined && getDecisionProposal(state, item.id) === undefined) {
-					return `${displayId} has no proposal to accept`;
-				}
+				if (active) return `${displayId} is actively explored; use /decision return or /decision exit first`;
+				if (item.lifecycle !== "proposed") return `${displayId} has no lightweight proposal to accept`;
 				if (item.record === undefined) return `${displayId} has no complete record to accept`;
 				return undefined;
+			case "reject":
+				if (active) return `${displayId} is actively explored; use /decision return or /decision exit first`;
+				return item.lifecycle === "proposed" ? undefined : `${displayId} has no lightweight proposal to reject`;
 			case "ignore":
 				if (active) return `${displayId} is actively explored; use /decision return or /decision exit first`;
 				if (item.lifecycle === "ignored") return `${displayId} is already ignored`;
-				if (item.lifecycle === "resolved") return `${displayId} is already resolved; reopen it before ignoring it`;
+				if (item.lifecycle === "resolved" || item.lifecycle === "deferred") return `${displayId} is terminal; reopen it before ignoring it`;
 				return undefined;
 			case "defer":
 				if (active) return `${displayId} is actively explored; use /decision return or /decision exit first`;
@@ -739,30 +748,30 @@ export function decisionActionReason(state: LedgerState, id: string, action: Dec
 				if (active) return `${displayId} is actively explored and cannot be removed`;
 				return undefined;
 		}
-	} catch (error) {
-		return errorMessageForLedger(error);
-	}
+	} catch (error) { return errorMessageForLedger(error); }
 }
 
-function errorMessageForLedger(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
+function errorMessageForLedger(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
-export function applyDecisionAction(state: LedgerState, id: string, action: Exclude<DecisionAction, "explore">): LedgerState {
+export function applyDecisionAction(
+	state: LedgerState,
+	id: string,
+	action: Exclude<DecisionAction, "explore">,
+	record?: DecisionRecord,
+): LedgerState {
 	const reason = decisionActionReason(state, id, action);
 	if (reason !== undefined) throw new Error(reason);
 	const normalizedId = normalizeDecisionId(id);
 	switch (action) {
-		case "accept":
-			return applyBatchUpdates(state, [{ id: normalizedId, lifecycle: "resolved" }]);
-		case "ignore":
-			return applyBatchUpdates(state, [{ id: normalizedId, lifecycle: "ignored" }]);
-		case "defer":
-			return applyBatchUpdates(state, [{ id: normalizedId, lifecycle: "deferred" }]);
-		case "reopen":
-			return applyBatchUpdates(state, [{ id: normalizedId, lifecycle: "open" }]);
-		case "remove":
-			return removeDecisionItems(state, [normalizedId]);
+		case "resolve":
+			if (record === undefined) throw new Error(`${formatDecisionId(id)} requires a complete record to resolve`);
+			return resolveDecision(state, normalizedId, record);
+		case "accept": return acceptDecisionProposal(state, normalizedId);
+		case "reject": return rejectDecisionProposal(state, normalizedId);
+		case "ignore": return ignoreDecision(state, normalizedId);
+		case "defer": return deferDecision(state, normalizedId);
+		case "reopen": return reopenDecision(state, normalizedId);
+		case "remove": return removeDecisionItems(state, [normalizedId]);
 	}
 }
 
@@ -775,14 +784,7 @@ export function exitExploration(state: LedgerState, id?: string): LedgerState {
 
 	const nextState = cloneState(state);
 	const item = findItem(nextState.ledger!, focused.id);
-	const origin = focused.exploration?.origin ?? (focused.lifecycle === "proposed" ? "proposed" : "open");
-	item.lifecycle = origin === "proposed" ? "proposed" : "open";
 	item.exploration = undefined;
-	if (origin === "open") {
-		item.record = undefined;
-		item.proposalMarkdown = undefined;
-		if (nextState.proposal?.itemId.toUpperCase() === item.id.toUpperCase()) nextState.proposal = undefined;
-	}
 	return nextState;
 }
 
@@ -812,10 +814,7 @@ export function startExploration(
 	const nextState = cloneState(state);
 	const nextItem = findItem(nextState.ledger!, normalizedId);
 	const origin: ExplorationOrigin = nextItem.lifecycle === "proposed" ? "proposed" : "open";
-	nextItem.lifecycle = "exploring";
 	nextItem.exploration = { returnEntryId, returnLabel, origin };
-	const proposal = getDecisionProposal(nextState, normalizedId);
-	if (proposal !== undefined) nextState.proposal = proposal;
 	return nextState;
 }
 
@@ -833,53 +832,109 @@ export function switchExploration(
 	return startExploration(state, normalizedId, returnEntryId, returnLabel);
 }
 
-export function proposeDecisionRecord(state: LedgerState, id: string, record: DecisionRecord, markdown: string): LedgerState {
+export function proposeDecisionRecord(state: LedgerState, id: string, record: DecisionRecord, markdown?: string): LedgerState {
 	const currentLedger = state.ledger;
 	assertLedger(currentLedger);
 	const normalizedId = normalizeDecisionId(id);
 	const item = findItem(currentLedger, normalizedId);
 	if (item.lifecycle === "ignored") throw new Error(`${formatDecisionId(id)} is ignored and cannot receive a proposal`);
-	const lightweight = (item.lifecycle === "open" || item.lifecycle === "proposed") && item.exploration === undefined;
-	const explored = isExplorationLifecycle(item.lifecycle) && item.exploration !== undefined;
-	if (!lightweight && !explored) {
-		throw new Error(`${formatDecisionId(id)} must be open or actively explored before proposing a record`);
+	if (item.lifecycle !== "open" && item.lifecycle !== "proposed") {
+		throw new Error(`${formatDecisionId(id)} must be open or proposed before proposing a record`);
 	}
 	assertRecord(record);
-
 	const nextState = cloneState(state);
 	const nextItem = findItem(nextState.ledger!, normalizedId);
 	nextItem.lifecycle = "proposed";
 	nextItem.record = cloneRecord(record);
-	nextItem.proposalMarkdown = markdown;
-	// Lightweight proposals intentionally have no exploration bookmark. Explored
-	// proposals retain theirs so /decision return remains the only finalization path.
-	nextState.proposal = { itemId: normalizedId, record: cloneRecord(record), markdown };
+	nextItem.proposalMarkdown = markdown ?? renderDecisionRecordMarkdown(nextItem, record);
 	return nextState;
 }
 
-export function resolveDecisionRecord(state: LedgerState, id: string, record: DecisionRecord): LedgerState {
-	const currentLedger = state.ledger;
-	assertLedger(currentLedger);
+function updateDisposition(state: LedgerState, id: string, lifecycle: "deferred" | "ignored"): LedgerState {
+	const reason = decisionActionReason(state, id, lifecycle === "ignored" ? "ignore" : "defer");
+	if (reason !== undefined) throw new Error(reason);
+	const nextState = cloneState(state);
+	const item = findItem(nextState.ledger!, id);
+	item.lifecycle = lifecycle;
+	item.proposalMarkdown = undefined;
+	item.exploration = undefined;
+	return nextState;
+}
+
+export function resolveDecision(state: LedgerState, id: string, record: DecisionRecord): LedgerState {
+	const reason = decisionActionReason(state, id, "resolve");
+	if (reason !== undefined) throw new Error(reason);
+	assertRecord(record);
+	const nextState = cloneState(state);
+	const item = findItem(nextState.ledger!, id);
+	item.lifecycle = "resolved";
+	item.record = cloneRecord(record);
+	item.proposalMarkdown = undefined;
+	return nextState;
+}
+
+export function acceptDecisionProposal(state: LedgerState, id: string): LedgerState {
+	const reason = decisionActionReason(state, id, "accept");
+	if (reason !== undefined) throw new Error(reason);
+	const nextState = cloneState(state);
+	const item = findItem(nextState.ledger!, id);
+	item.lifecycle = "resolved";
+	item.proposalMarkdown = undefined;
+	return nextState;
+}
+
+export function rejectDecisionProposal(state: LedgerState, id: string): LedgerState {
+	const reason = decisionActionReason(state, id, "reject");
+	if (reason !== undefined) throw new Error(reason);
+	const nextState = cloneState(state);
+	const item = findItem(nextState.ledger!, id);
+	item.lifecycle = "open";
+	item.record = undefined;
+	item.proposalMarkdown = undefined;
+	return nextState;
+}
+
+export function deferDecision(state: LedgerState, id: string): LedgerState {
+	return updateDisposition(state, id, "deferred");
+}
+
+export function ignoreDecision(state: LedgerState, id: string): LedgerState {
+	return updateDisposition(state, id, "ignored");
+}
+
+export function reopenDecision(state: LedgerState, id: string): LedgerState {
+	const reason = decisionActionReason(state, id, "reopen");
+	if (reason !== undefined) throw new Error(reason);
+	const nextState = cloneState(state);
+	const item = findItem(nextState.ledger!, id);
+	item.lifecycle = "open";
+	item.proposalMarkdown = undefined;
+	return nextState;
+}
+
+export function finalizeExploredProposal(state: LedgerState, id: string, record: DecisionRecord): LedgerState {
+	const ledger = state.ledger;
+	assertLedger(ledger);
 	const normalizedId = normalizeDecisionId(id);
-	const item = findItem(currentLedger, normalizedId);
-	if (item.lifecycle === "resolved") throw new Error(`${formatDecisionId(id)} is already resolved`);
-	if (item.exploration === undefined || (item.lifecycle !== "proposed" && item.lifecycle !== "exploring")) {
-		throw new Error(`${formatDecisionId(id)} must be finalized with /decision return while it is being explored`);
+	const item = findItem(ledger, normalizedId);
+	if (item.exploration === undefined || item.lifecycle !== "proposed") {
+		throw new Error(`${formatDecisionId(id)} must be a proposed actively explored item; use /decision return`);
 	}
-	if (getDecisionProposal(state, normalizedId) === undefined) {
+	if (item.record === undefined || item.proposalMarkdown === undefined) {
 		throw new Error(`${formatDecisionId(id)} has no record proposal to finalize`);
 	}
 	assertRecord(record);
-
 	const nextState = cloneState(state);
 	const nextItem = findItem(nextState.ledger!, normalizedId);
 	nextItem.lifecycle = "resolved";
 	nextItem.record = cloneRecord(record);
 	nextItem.proposalMarkdown = undefined;
 	nextItem.exploration = undefined;
-	if (nextState.proposal?.itemId.toUpperCase() === normalizedId) nextState.proposal = undefined;
 	return nextState;
 }
+
+/** @deprecated Use finalizeExploredProposal for /decision return. */
+export const resolveDecisionRecord = finalizeExploredProposal;
 
 export function renderDecisionRecordBody(record: DecisionRecord, headingLevel = 3): string {
 	const heading = "#".repeat(Math.max(1, Math.floor(headingLevel)));
@@ -997,22 +1052,28 @@ function escapeMarkdownTableCell(value: string): string {
 }
 
 export function formatDecisionOverview(state: LedgerState, maxChars = 12000): string {
-	if (state.ledger === undefined) return boundLedgerOutput("No decision ledger on this branch.", maxChars);
-	const unresolved = state.ledger.items.filter(isDecisionUnresolved);
+	if (state.ledger === undefined && (state.adrs?.length ?? 0) === 0) return boundLedgerOutput("No decision ledger on this branch.", maxChars);
+	const items = state.ledger?.items ?? [];
+	const unresolved = items.filter(isDecisionUnresolved);
 	const lines: string[] = [
-		`# Decision ledger (${unresolved.length} unresolved / ${state.ledger.items.length} total)`,
+		`# Decision ledger (${unresolved.length} unresolved / ${items.length} total)`,
 		"",
-		"| ID | Lifecycle | Title |",
-		"| --- | --- | --- |",
+		"| ID | Lifecycle | ADR | Title |",
+		"| --- | --- | --- | --- |",
 	];
-	for (const item of orderDecisionItems(state.ledger.items)) {
-		lines.push(`| ${formatDecisionId(item.id)} | ${item.lifecycle} | ${escapeMarkdownTableCell(decisionDisplayTitle(item))} |`);
+	for (const item of orderDecisionItems(items)) {
+		const adr = state.adrs?.find((candidate) => candidate.adrId === item.adrId);
+		const durable = adr === undefined ? "—" : `${durableBadge(item, state)} \`${escapeMarkdownTableCell(adr.slug)}\``;
+		lines.push(`| ${formatDecisionId(item.id)} | ${item.lifecycle} | ${durable} | ${escapeMarkdownTableCell(decisionDisplayTitle(item))} |`);
+	}
+	if ((state.adrs?.length ?? 0) > 0) {
+		lines.push("", "## ADR registry", "", "| Slug | Lifecycle | File | Sources |", "| --- | --- | --- | --- |");
+		for (const adr of state.adrs!) lines.push(`| \`${adr.slug}\` | ${adr.lifecycle} | \`${escapeMarkdownTableCell(adr.relativePath)}\` | ${adr.sourceDecisionIds.map((id) => formatDecisionId(id)).join(", ")} |`);
 	}
 	const focused = getFocusedExploration(state);
 	if (focused?.exploration !== undefined) {
 		lines.push("", `Focused exploration: ${formatDecisionId(focused.id)} (return label: \`${focused.exploration.returnLabel}\`)`);
 	}
-	if (state.proposal !== undefined) lines.push("", `Record proposal ready for ${formatDecisionId(state.proposal.itemId)}.`);
 	return boundLedgerOutput(lines.join("\n"), maxChars);
 }
 
@@ -1038,6 +1099,7 @@ export function formatDecisionDetail(state: LedgerState, id: string, maxChars = 
 		"",
 		`Title: ${decisionDisplayTitle(item)}`,
 		`Lifecycle: **${item.lifecycle}**`,
+		...(state.adrs?.find((adr) => adr.adrId === item.adrId) === undefined ? [] : durableDetailLines(state.adrs!.find((adr) => adr.adrId === item.adrId)!, "")),
 		"",
 		formatDecisionDetailBody(item),
 	];
@@ -1082,6 +1144,10 @@ export function formatDecisionExport(state: LedgerState): string {
 		"",
 		"Current branch decisions only. Ignored decisions are shown last for readability.",
 	];
+	if ((state.adrs?.length ?? 0) > 0) {
+		lines.push("", "## ADR registry");
+		for (const adr of state.adrs!) lines.push("", `### ADR \`${adr.slug}\``, ...durableDetailLines(adr, "- "));
+	}
 	const ledger = state.ledger;
 	if (ledger === undefined) {
 		lines.push("", "No decisions are present on this branch.");
@@ -1097,6 +1163,7 @@ export function formatDecisionExport(state: LedgerState): string {
 			"",
 			`## Decision ${formatDecisionId(item.id)}`,
 			`- Lifecycle: **${item.lifecycle}**`,
+			...(state.adrs?.find((adr) => adr.adrId === item.adrId) === undefined ? [] : durableDetailLines(state.adrs!.find((adr) => adr.adrId === item.adrId)!, "- ")),
 			"",
 			"### Title",
 			markdownCodeBlock(decisionDisplayTitle(item)),
@@ -1118,17 +1185,43 @@ export function formatDecisionExport(state: LedgerState): string {
 type LegacyDisposition = "chosen" | "accepted" | "ignored" | "follow_up";
 
 function normalizeStoredLifecycle(value: unknown, disposition: unknown): { lifecycle: Lifecycle; legacyExplorationOrigin: ExplorationOrigin } | undefined {
-	if (typeof disposition !== "undefined" && !["chosen", "accepted", "ignored", "follow_up"].includes(String(disposition))) {
-		return undefined;
-	}
+	if (typeof disposition !== "undefined" && !["chosen", "accepted", "ignored", "follow_up"].includes(String(disposition))) return undefined;
 	const legacyDisposition = disposition as LegacyDisposition | undefined;
 	if (legacyDisposition === "ignored") return { lifecycle: "ignored", legacyExplorationOrigin: "open" };
-	if (legacyDisposition === "chosen" || legacyDisposition === "accepted" || legacyDisposition === "follow_up") {
-		return { lifecycle: "resolved", legacyExplorationOrigin: "open" };
-	}
-	if (value === "resolution_proposed") return { lifecycle: "proposed", legacyExplorationOrigin: "open" };
+	if (legacyDisposition === "chosen" || legacyDisposition === "accepted" || legacyDisposition === "follow_up") return { lifecycle: "resolved", legacyExplorationOrigin: "open" };
+	if (value === "resolution_proposed") return { lifecycle: "proposed", legacyExplorationOrigin: "proposed" };
+	if (value === "exploring") return { lifecycle: "open", legacyExplorationOrigin: "open" };
 	if (typeof value !== "string" || !(LIFECYCLES as readonly string[]).includes(value)) return undefined;
 	return { lifecycle: value as Lifecycle, legacyExplorationOrigin: value === "proposed" ? "proposed" : "open" };
+}
+
+function parseDurablePromotion(value: unknown): DurablePromotion | undefined {
+	if (!isObject(value) ||
+		typeof value.adrId !== "string" ||
+		typeof value.slug !== "string" ||
+		typeof value.repositoryRoot !== "string" ||
+		typeof value.relativePath !== "string" ||
+		typeof value.baseSemanticDigest !== "string" ||
+		typeof value.baseSourceFingerprint !== "string" ||
+		typeof value.baseSource !== "string" ||
+		!Array.isArray(value.sourceDecisionIds) ||
+		!value.sourceDecisionIds.every((id) => typeof id === "string")) return undefined;
+	if (value.lifecycle !== "draft" && value.lifecycle !== "accepted" && value.lifecycle !== "superseded") return undefined;
+	try {
+		const adr = importDurableAdr(value.baseSource);
+		if (adr.id !== value.adrId || adr.lifecycle !== value.lifecycle || adr.semanticDigest !== value.baseSemanticDigest || adr.sourceFingerprint !== value.baseSourceFingerprint) return undefined;
+	} catch { return undefined; }
+	return {
+		adrId: value.adrId,
+		slug: value.slug,
+		repositoryRoot: value.repositoryRoot,
+		relativePath: value.relativePath,
+		lifecycle: value.lifecycle,
+		baseSemanticDigest: value.baseSemanticDigest,
+		baseSourceFingerprint: value.baseSourceFingerprint,
+		baseSource: value.baseSource,
+		sourceDecisionIds: [...value.sourceDecisionIds],
+	};
 }
 
 function parseRecord(value: unknown): DecisionRecord | undefined {
@@ -1156,6 +1249,7 @@ function parseRecord(value: unknown): DecisionRecord | undefined {
 function parseState(value: unknown): LedgerState | undefined {
 	if (!isObject(value)) return undefined;
 	let ledger: DecisionLedger | undefined;
+	const legacyAdrs = new Map<string, DurablePromotion>();
 	if (value.ledger !== undefined) {
 		const rawLedger = value.ledger;
 		if (!isObject(rawLedger) || !Array.isArray(rawLedger.items)) return undefined;
@@ -1173,6 +1267,14 @@ function parseState(value: unknown): LedgerState | undefined {
 			if (normalized === undefined) return undefined;
 			const record = rawItem.record === undefined ? undefined : parseRecord(rawItem.record);
 			if (rawItem.record !== undefined && record === undefined) return undefined;
+			const durable = rawItem.durable === undefined ? undefined : parseDurablePromotion(rawItem.durable);
+			if (rawItem.durable !== undefined && durable === undefined) return undefined;
+			const adrId = typeof rawItem.adrId === "string" ? rawItem.adrId : durable?.adrId;
+			if (durable !== undefined && value.adrs === undefined) {
+				const prior = legacyAdrs.get(durable.adrId);
+				if (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(durable)) return undefined;
+				legacyAdrs.set(durable.adrId, durable);
+			}
 			const proposalMarkdown = rawItem.proposalMarkdown === undefined
 				? undefined
 				: typeof rawItem.proposalMarkdown === "string"
@@ -1182,33 +1284,24 @@ function parseState(value: unknown): LedgerState | undefined {
 			let exploration: Exploration | undefined;
 			if (rawItem.exploration !== undefined) {
 				const rawExploration = rawItem.exploration;
-				if (
-					!isObject(rawExploration) ||
-					typeof rawExploration.returnEntryId !== "string" ||
-					typeof rawExploration.returnLabel !== "string"
-				) {
+				if (isObject(rawExploration) && typeof rawExploration.returnEntryId === "string" && typeof rawExploration.returnLabel === "string") {
+					const origin = rawExploration.origin === undefined
+						? normalized.legacyExplorationOrigin
+						: rawExploration.origin === "open" || rawExploration.origin === "proposed" ? rawExploration.origin : undefined;
+					if (origin !== undefined) exploration = { returnEntryId: rawExploration.returnEntryId, returnLabel: rawExploration.returnLabel, origin };
+				} else if (rawItem.lifecycle !== "exploring") {
 					return undefined;
 				}
-				const origin = rawExploration.origin === undefined
-					? normalized.legacyExplorationOrigin
-					: rawExploration.origin === "open" || rawExploration.origin === "proposed"
-						? rawExploration.origin
-						: undefined;
-				if (origin === undefined) return undefined;
-				exploration = {
-					returnEntryId: rawExploration.returnEntryId,
-					returnLabel: rawExploration.returnLabel,
-					origin,
-				};
 			}
 			items.push({
 				id: rawItem.id,
 				...(rawItem.title === undefined ? {} : { title: rawItem.title }),
 				point: rawItem.point,
-				lifecycle: normalized.lifecycle,
+				lifecycle: rawItem.lifecycle === "exploring" && exploration?.origin === "proposed" ? "proposed" : normalized.lifecycle,
 				...(record === undefined ? {} : { record }),
 				...(proposalMarkdown === undefined ? {} : { proposalMarkdown }),
 				...(exploration === undefined ? {} : { exploration }),
+				...(adrId === undefined ? {} : { adrId }),
 			});
 		}
 		ledger = {
@@ -1216,6 +1309,24 @@ function parseState(value: unknown): LedgerState | undefined {
 			...(nextId === undefined ? {} : { nextId }),
 			...(usedIds === undefined ? {} : { usedIds }),
 		};
+	}
+
+	let adrs: DurablePromotion[] | undefined;
+	if (value.adrs !== undefined) {
+		if (!Array.isArray(value.adrs)) return undefined;
+		adrs = [];
+		for (const rawAdr of value.adrs) {
+			const adr = parseDurablePromotion(rawAdr);
+			if (adr === undefined || adrs.some((existing) => existing.adrId === adr.adrId || existing.slug === adr.slug)) return undefined;
+			adrs.push(adr);
+		}
+	} else if (legacyAdrs.size > 0) {
+		adrs = [...legacyAdrs.values()];
+	}
+	if (ledger !== undefined) {
+		for (const item of ledger.items) {
+			if (item.adrId !== undefined && !adrs?.some((adr) => adr.adrId === item.adrId)) delete item.adrId;
+		}
 	}
 
 	let proposal: DecisionProposal | undefined;
@@ -1229,11 +1340,12 @@ function parseState(value: unknown): LedgerState | undefined {
 		const proposalItem = ledger?.items.find(
 			(item) => item.id.toUpperCase() === proposal!.itemId.toUpperCase(),
 		);
-		if (proposalItem !== undefined && proposalItem.proposalMarkdown === undefined) {
-			proposalItem.proposalMarkdown = proposal.markdown;
+		if (proposalItem !== undefined) {
+			if (proposalItem.record === undefined) proposalItem.record = cloneRecord(proposal.record);
+			if (proposalItem.proposalMarkdown === undefined) proposalItem.proposalMarkdown = proposal.markdown;
 		}
 	}
-	return { ...(ledger === undefined ? {} : { ledger }), ...(proposal === undefined ? {} : { proposal }) };
+	return cloneState({ ...(ledger === undefined ? {} : { ledger }), ...(adrs === undefined ? {} : { adrs }) });
 }
 
 export function extractLedgerStateFromEntry(entry: LedgerEntryLike): LedgerState | undefined {

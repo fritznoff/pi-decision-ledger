@@ -26,16 +26,19 @@ import {
 } from "@earendil-works/pi-tui";
 import { Type, type Static } from "typebox";
 import {
+	ADR_EDIT_MESSAGE_TYPE,
 	CUSTOM_ENTRY_TYPE,
 	DECISIONS_COMMANDS,
 	DECISION_COMMANDS,
+	DECISION_ID_COMMANDS,
+	PROMOTE_REPOSITORY_FLAG,
+	PROMOTE_SLUG_FLAG,
 	INITIAL_LIFECYCLES,
 	DECISION_EXPORT_MESSAGE_TYPE,
 	DECISION_OVERVIEW_MESSAGE_TYPE,
 	FOCUS_MARKER_MESSAGE_TYPE,
 	FOCUS_TRANSITION_MESSAGE_TYPE,
 	REVIEW_DRAFT_MESSAGE_TYPE,
-	LIFECYCLES,
 	RETURN_RECEIPT_MESSAGE_TYPE,
 	TOOL_NAME,
 	addDecisionItems,
@@ -45,6 +48,7 @@ import {
 	cloneState,
 	completeDecisionCommandArguments,
 	decisionDisplayTitle,
+	durableBadge,
 	formatDecisionDetailBody,
 	formatDecisionId,
 	formatDecisionIdForTui,
@@ -53,6 +57,8 @@ import {
 	decisionOverviewDelivery,
 	applyDecisionAction,
 	decisionActionReason,
+	resolveDecision,
+	finalizeExploredProposal,
 	emptyLedgerState,
 	findNaturalLanguageExplorationReturnEntryId,
 	findNewestOffBranchSnapshot,
@@ -69,8 +75,6 @@ import {
 	proposeDecisionRecord,
 	replayLedgerBranch,
 	removeDecisionItems,
-	resolveDecisionRecord,
-	renderDecisionRecordMarkdown,
 	startExploration,
 	switchExploration,
 	exitExploration,
@@ -79,10 +83,25 @@ import {
 	type DecisionRecord,
 	type DecisionAction,
 	type DecisionUpdateInput,
+	type DurablePromotion,
 	type LedgerCustomEntryData,
 	type LedgerSessionDetails,
 	type LedgerState,
 } from "../src/ledger.ts";
+import {
+	acceptPromotedDecision,
+	collectPromotionSources,
+	discardPromotedDraft,
+	editPromotedDecision,
+	findRegisteredAdr,
+	parsePromoteArguments,
+	promoteReviewedBody,
+	promotedDraftBody,
+	promotionReviewBody,
+	reloadPromotedDecision,
+	checkoutPromotedDecision,
+} from "../src/promotion.ts";
+import { resolveGitRepositoryRoot } from "../src/durable-repository.ts";
 import { DecisionWidget, styledDecisionId, styledDecisionSymbol, styleDecisionPoint } from "../src/presentation.ts";
 
 const DecisionRecordSchema = Type.Object({
@@ -94,11 +113,14 @@ const DecisionRecordSchema = Type.Object({
 });
 
 const DecisionLedgerParams = Type.Object({
-	action: StringEnum(["list", "detail", "add", "update", "explore", "propose", "remove"] as const, {
+	action: StringEnum(["list", "detail", "add", "update", "explore", "propose", "resolve", "accept", "reject", "defer", "ignore", "reopen", "remove", "promote_adr"] as const, {
 		description: "Ledger operation",
 	}),
 	id: Type.Optional(Type.String({ description: "Decision ID" })),
-	ids: Type.Optional(Type.Array(Type.String({ description: "Decision ID" }), { description: "One or more decision IDs to remove" })),
+	ids: Type.Optional(Type.Array(Type.String({ description: "Decision ID" }), { description: "Decision IDs to remove, or the ordered source set for promote_adr" })),
+	markdown: Type.Optional(Type.String({ description: "promote_adr only: the exact synthesized envelope-free ADR Markdown for the ordered source set" })),
+	slug: Type.Optional(Type.String({ description: "promote_adr only: optional stable lowercase kebab-case ADR slug" })),
+	repository: Type.Optional(Type.String({ description: "promote_adr only: optional Git repository root, resolved from the session cwd" })),
 	userRequested: Type.Optional(Type.Boolean({ description: "True only when the user explicitly requested removal" })),
 	items: Type.Optional(
 		Type.Array(
@@ -122,9 +144,8 @@ const DecisionLedgerParams = Type.Object({
 		Type.Array(
 			Type.Object({
 				id: Type.String({ description: "Decision ID" }),
+				title: Type.Optional(Type.String({ description: "Replacement decision title" })),
 				point: Type.Optional(Type.String({ description: "Replacement decision point" })),
-				lifecycle: Type.Optional(StringEnum(LIFECYCLES, { description: "New lifecycle" })),
-				record: Type.Optional(DecisionRecordSchema),
 			}),
 		),
 	),
@@ -134,8 +155,10 @@ const DecisionLedgerParams = Type.Object({
 type DecisionLedgerParams = Static<typeof DecisionLedgerParams>;
 type LedgerAction = DecisionLedgerParams["action"];
 
-const DECISION_USAGE = `Usage: /decision capture | /decision explore <ID> | /decision remove <ID> [<ID> ...] | /decision return | /decision exit`;
+const DECISION_USAGE = `Usage: /decision capture | /decision explore <ID> | /decision promote <ID> [<ID> ...] [--slug <slug>] [${PROMOTE_REPOSITORY_FLAG} <path>] | /decision remove <ID> [<ID> ...] | /decision return | /decision exit`;
 const DECISIONS_USAGE = `Usage: /decisions [${DECISIONS_COMMANDS.join(" | ")}]`;
+const ADR_ACTIONS = ["edit", "reload", "discard", "accept"] as const;
+const ADR_USAGE = `Usage: /adr <${ADR_ACTIONS.join(" | ")}> <slug>`;
 const RETURN_SUMMARY_INSTRUCTIONS = (id: string): string => [
 	`The exact reviewed decision record for ${formatDecisionId(id)} is already persisted separately.`,
 	"Create a complementary handoff for this focused exploration only.",
@@ -202,7 +225,7 @@ function contentText(content: unknown): string {
 function decisionSelectItems(state: LedgerState, theme: Theme): SelectItem[] {
 	return orderDecisionItems(state.ledger?.items ?? []).map((item) => ({
 		value: item.id,
-		label: `${styledDecisionId(item.id, theme)}  ${styledDecisionSymbol(item, theme)} ${item.lifecycle}`,
+		label: `${styledDecisionId(item.id, theme)}  ${styledDecisionSymbol(item, theme)} ${item.lifecycle}${state.adrs?.find((adr) => adr.adrId === item.adrId) === undefined ? "" : ` ${theme.fg("accent", `[ADR ${state.adrs!.find((adr) => adr.adrId === item.adrId)!.lifecycle}]`)}`}`,
 		description: styleDecisionPoint(item, theme),
 	}));
 }
@@ -267,7 +290,7 @@ type DecisionAutocompleteContext =
 		}
 	| {
 			kind: "ids";
-			command: "explore" | "remove";
+			command: string;
 			prefix: string;
 			replacementStart: number;
 			selectedIds: string[];
@@ -320,7 +343,8 @@ function parseDecisionAutocompleteContext(line: string, cursorCol: number): Deci
 
 	const remainder = argumentText.slice(firstToken.value.length);
 	if (remainder.length === 0) return { kind: "blocked" };
-	if (subcommand !== "explore" && subcommand !== "remove") return { kind: "blocked" };
+	const arity = DECISION_ID_COMMANDS[subcommand];
+	if (arity === undefined) return { kind: "blocked" };
 	if (!/^[ \t]/.test(remainder)) return { kind: "blocked" };
 
 	const idTextStart = firstToken.end;
@@ -328,7 +352,9 @@ function parseDecisionAutocompleteContext(line: string, cursorCol: number): Deci
 	const hasTrailingWhitespace = /[ \t]$/.test(argumentText);
 	const partialToken = hasTrailingWhitespace ? undefined : idTokens.at(-1);
 	const selectedTokens = partialToken === undefined ? idTokens : idTokens.slice(0, -1);
-	if (subcommand === "explore" && selectedTokens.length > 0) return { kind: "blocked" };
+	if (arity === "single" && selectedTokens.length > 0) return { kind: "blocked" };
+	// After --repo the default provider completes the repository path.
+	if (subcommand === "promote" && selectedTokens.some((token) => token.value === PROMOTE_REPOSITORY_FLAG)) return null;
 
 	return {
 		kind: "ids",
@@ -353,10 +379,18 @@ function decisionAutocompleteSuggestions(
 		return matches.length === 0 ? null : matches.map((command) => ({ value: command, label: command }));
 	}
 
+	if (context.command === "promote" && context.prefix.startsWith("-")) {
+		if (context.selectedIds.length === 0) return null;
+		return [
+			...(PROMOTE_SLUG_FLAG.startsWith(context.prefix) && !context.selectedIds.includes(PROMOTE_SLUG_FLAG) ? [{ value: PROMOTE_SLUG_FLAG, label: PROMOTE_SLUG_FLAG, description: "stable ADR slug" }] : []),
+			...(PROMOTE_REPOSITORY_FLAG.startsWith(context.prefix) && !context.selectedIds.includes(PROMOTE_REPOSITORY_FLAG) ? [{ value: PROMOTE_REPOSITORY_FLAG, label: PROMOTE_REPOSITORY_FLAG, description: "explicit Git repository root" }] : []),
+		];
+	}
 	const selectedIds = new Set(context.selectedIds.map((id) => id.toUpperCase()));
 	const prefix = context.prefix.toUpperCase();
 	const matches = items.filter(
-		(item) => !selectedIds.has(item.id.toUpperCase()) && item.id.toUpperCase().startsWith(prefix),
+		(item) => !selectedIds.has(item.id.toUpperCase()) && item.id.toUpperCase().startsWith(prefix) &&
+			(context.command === "promote" ? item.adrId === undefined : true),
 	);
 	return matches.length === 0
 		? null
@@ -409,7 +443,83 @@ function wrapDecisionAutocomplete(
 		},
 		shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
 			const context = parseDecisionAutocompleteContext(lines[cursorLine] ?? "", cursorCol);
-			if (context !== null) return false;
+			// Pi gates explicit Tab completion through this file-oriented hook. Return
+			// true so our intercepted command suggestions are requested; getSuggestions
+			// above still prevents generic paths from leaking into the result.
+			if (context !== null) return true;
+			return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
+		},
+	};
+}
+
+type AdrAutocompleteContext =
+	| { kind: "action"; prefix: string; replacementStart: number; needsSeparator: boolean }
+	| { kind: "slug"; action: (typeof ADR_ACTIONS)[number]; prefix: string; replacementStart: number; needsSeparator: boolean }
+	| { kind: "blocked" };
+
+function parseAdrAutocompleteContext(line: string, cursorCol: number): AdrAutocompleteContext | null {
+	const beforeCursor = line.slice(0, Math.max(0, cursorCol));
+	if (beforeCursor !== "/adr" && !/^\/adr[ \t]/.test(beforeCursor)) return null;
+	if (beforeCursor === "/adr") return { kind: "action", prefix: "", replacementStart: cursorCol, needsSeparator: true };
+	const afterCommand = beforeCursor.slice("/adr".length);
+	const leadingWhitespace = afterCommand.match(/^[ \t]*/)?.[0].length ?? 0;
+	const argumentsStart = "/adr".length + leadingWhitespace;
+	const argumentText = beforeCursor.slice(argumentsStart);
+	const tokens = tokenSpans(argumentText, argumentsStart);
+	if (tokens.length === 0) return { kind: "action", prefix: "", replacementStart: cursorCol, needsSeparator: false };
+	const first = tokens[0]!;
+	const action = first.value.toLowerCase();
+	if (!(ADR_ACTIONS as readonly string[]).includes(action)) {
+		return tokens.length === 1 ? { kind: "action", prefix: first.value, replacementStart: first.start, needsSeparator: false } : { kind: "blocked" };
+	}
+	if (tokens.length > 2) return { kind: "blocked" };
+	const hasActionSeparator = argumentText.length > first.value.length;
+	if (!hasActionSeparator) return { kind: "slug", action: action as (typeof ADR_ACTIONS)[number], prefix: "", replacementStart: cursorCol, needsSeparator: true };
+	const second = tokens[1];
+	return {
+		kind: "slug",
+		action: action as (typeof ADR_ACTIONS)[number],
+		prefix: second?.value ?? "",
+		replacementStart: second?.start ?? cursorCol,
+		needsSeparator: false,
+	};
+}
+
+function adrAutocompleteSuggestions(context: AdrAutocompleteContext, adrs: readonly DurablePromotion[]): AutocompleteItem[] | null {
+	if (context.kind === "blocked") return null;
+	if (context.kind === "action") {
+		const prefix = context.prefix.toLowerCase();
+		const matches = ADR_ACTIONS.filter((action) => action.startsWith(prefix));
+		return matches.length === 0 ? null : matches.map((action) => ({ value: action, label: action, description: `ADR ${action}` }));
+	}
+	const prefix = context.prefix.toLowerCase();
+	const matches = adrs.filter((adr) => (context.action === "reload" || adr.lifecycle === "draft") && adr.slug.toLowerCase().startsWith(prefix));
+	return matches.length === 0 ? null : matches.map((adr) => ({ value: adr.slug, label: adr.slug, description: `${adr.lifecycle} · ${adr.relativePath}` }));
+}
+
+function wrapAdrAutocomplete(current: AutocompleteProvider, getAdrs: () => readonly DurablePromotion[]): AutocompleteProvider {
+	return {
+		triggerCharacters: current.triggerCharacters,
+		async getSuggestions(lines, cursorLine, cursorCol, options) {
+			const context = parseAdrAutocompleteContext(lines[cursorLine] ?? "", cursorCol);
+			if (context === null) return current.getSuggestions(lines, cursorLine, cursorCol, options);
+			const suggestions = adrAutocompleteSuggestions(context, getAdrs());
+			return suggestions === null ? null : { items: suggestions, prefix: context.kind === "blocked" ? "" : context.prefix };
+		},
+		applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+			const context = parseAdrAutocompleteContext(lines[cursorLine] ?? "", cursorCol);
+			if (context === null) return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+			if (context.kind === "blocked") return { lines, cursorLine, cursorCol };
+			const line = lines[cursorLine] ?? "";
+			const insertion = context.needsSeparator ? ` ${item.value}` : item.value;
+			const nextLines = [...lines];
+			nextLines[cursorLine] = `${line.slice(0, context.replacementStart)}${insertion}${line.slice(cursorCol)}`;
+			return { lines: nextLines, cursorLine, cursorCol: context.replacementStart + insertion.length };
+		},
+		shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+			// Despite the API name, Pi requires true here before it asks any provider
+			// for explicit Tab suggestions. The ADR interceptor supplies only slugs.
+			if (parseAdrAutocompleteContext(lines[cursorLine] ?? "", cursorCol) !== null) return true;
 			return current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true;
 		},
 	};
@@ -474,6 +584,8 @@ async function showDecisionDetails(state: LedgerState, id: string, ctx: Extensio
 			));
 			container.addChild(new Text(theme.fg("accent", theme.bold(decisionDisplayTitle(item))), 1, 0));
 			container.addChild(new Markdown(formatDecisionDetailBody(item), 1, 1, getMarkdownTheme()));
+			const associatedAdr = state.adrs?.find((adr) => adr.adrId === item.adrId);
+			if (associatedAdr !== undefined) container.addChild(new Text(`${theme.fg("accent", `ADR ${associatedAdr.lifecycle}`)} ${theme.fg("dim", `${associatedAdr.slug} (repository file is authoritative) ${associatedAdr.relativePath} in ${associatedAdr.repositoryRoot}; ADR ID ${associatedAdr.adrId}; sources ${tuiDecisionIds(associatedAdr.sourceDecisionIds)}`)}`, 1, 0));
 		}
 		container.addChild(new Text(theme.fg("dim", "Press Enter or Esc to return; Ctrl+C to close"), 1, 0));
 		container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
@@ -566,7 +678,7 @@ async function showDecisionList(
 			selectList.onSelect = (item) => done({ kind: "details", id: item.value });
 			selectList.onCancel = () => done(null);
 			container.addChild(selectorComponent(selectList));
-			container.addChild(new Text(theme.fg("dim", "↑↓ navigate • Enter details • e explore • a accept/review • i ignore • r reopen • f defer • Delete remove • ? help • Esc/Ctrl+C close"), 1, 0));
+			container.addChild(new Text(theme.fg("dim", "↑↓ navigate • Enter details • e explore • a accept/review • x reject • i ignore • r reopen • f defer • Delete remove • ? help • Esc/Ctrl+C close"), 1, 0));
 			container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
 
 			return {
@@ -587,7 +699,7 @@ async function showDecisionList(
 						return;
 					}
 					const action = data.length === 1 ? data.toLowerCase() : "";
-					const actionByKey: Record<string, DecisionAction> = { e: "explore", a: "accept", i: "ignore", r: "reopen", f: "defer" };
+					const actionByKey: Record<string, DecisionAction> = { e: "explore", a: "accept", x: "reject", i: "ignore", r: "reopen", f: "defer" };
 					if (actionByKey[action] !== undefined) {
 						const item = selectList.getSelectedItem();
 						if (item !== null) done({ kind: "action", id: item.value, action: actionByKey[action] });
@@ -600,7 +712,7 @@ async function showDecisionList(
 		});
 		if (selected === null) return;
 		if (selected.kind === "help") {
-			notify(ctx, "Keys: e explore, a accept/review, i ignore, r reopen, f defer, Delete remove, Enter details, ? help, Esc/Ctrl+C close.", "info");
+			notify(ctx, "Keys: e explore, a accept/review, x reject, i ignore, r reopen, f defer, Delete remove, Enter details, ? help, Esc/Ctrl+C close.", "info");
 			continue;
 		}
 		if (selected.kind === "details") {
@@ -637,16 +749,7 @@ function reconstruct(ctx: ExtensionContext): LedgerState {
 	return replayLedgerBranch(ctx.sessionManager.getBranch(), ctx.sessionManager.getEntries());
 }
 
-function updateFeedback(state: LedgerState, updates: readonly DecisionUpdateInput[]): string {
-	const resolved = updates
-		.filter((update) => update.lifecycle === "resolved")
-		.map((update) => {
-			const id = normalizeDecisionId(update.id);
-			const item = state.ledger?.items.find((candidate) => candidate.id.toUpperCase() === id);
-			return item === undefined ? undefined : formatReturnReceipt(item.id, item.record?.decision ?? item.point);
-		})
-		.filter((message): message is string => message !== undefined);
-	if (resolved.length > 0) return resolved.join("\n");
+function updateFeedback(updates: readonly DecisionUpdateInput[]): string {
 	return `Updated ${updates.map((update) => formatDecisionId(normalizeDecisionId(update.id))).join(", ")}.`;
 }
 
@@ -676,7 +779,7 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 
 	function installAutocomplete(ctx: ExtensionContext): void {
 		if (autocompleteInstalled || ctx.mode !== "tui" || !ctx.hasUI || typeof ctx.ui.addAutocompleteProvider !== "function") return;
-		ctx.ui.addAutocompleteProvider((current) => wrapDecisionAutocomplete(current, () => state.ledger?.items ?? []));
+		ctx.ui.addAutocompleteProvider((current) => wrapAdrAutocomplete(wrapDecisionAutocomplete(current, () => state.ledger?.items ?? []), () => state.adrs ?? []));
 		autocompleteInstalled = true;
 	}
 
@@ -792,7 +895,7 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 	async function reviewAndReturnProposal(ctx: ExtensionCommandContext): Promise<"resolved" | "cancelled"> {
 		const focused = getFocusedExploration(state);
 		const proposal = focused === undefined ? undefined : getDecisionProposal(state, focused.id);
-		if (!focused?.exploration || proposal === undefined) {
+		if (!focused?.exploration || focused.lifecycle !== "proposed" || proposal === undefined) {
 			clearReturnProgress(ctx);
 			notify(ctx, "Return requires a record proposal for the focused exploration.", "warning");
 			return "cancelled";
@@ -855,7 +958,7 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 					}
 					return "cancelled";
 				}
-				const finalizedState = resolveDecisionRecord(proposedState, focused.id, parsed.record);
+				const finalizedState = finalizeExploredProposal(proposedState, focused.id, parsed.record);
 				appendFocusStateTransition(finalizedState, "resolved", focused);
 				const receipt = formatReturnReceipt(focused.id, parsed.record.decision, tipLabel);
 				const currentContext = activeContext ?? ctx;
@@ -892,7 +995,15 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 	}
 
 	async function handleSelectorAction(id: string, action: DecisionAction, ctx: ExtensionCommandContext): Promise<"close" | "stay"> {
-		const reason = decisionActionReason(state, id, action);
+		const normalizedId = normalizeDecisionId(id);
+		const focusedForAction = getFocusedExploration(state);
+		const reviewingFocusedProposal = action === "accept"
+			&& focusedForAction?.id.toUpperCase() === normalizedId;
+		const reason = reviewingFocusedProposal
+			? getDecisionProposal(state, normalizedId) === undefined
+				? `${formatDecisionId(normalizedId)} has no proposal to review`
+				: undefined
+			: decisionActionReason(state, normalizedId, action);
 		if (reason !== undefined) {
 			notify(ctx, reason, "warning");
 			return "stay";
@@ -914,7 +1025,6 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 				if (nextFocus === undefined) throw new Error("exploration focus was not recorded");
 				appendFocusStateTransition(nextState, previousFocus === undefined ? "started" : "switched", nextFocus);
 				refreshWidget(state, ctx);
-				notify(ctx, `Exploring ${formatDecisionId(normalizeDecisionId(id))}. Return with /decision return after proposing a record.`, "warning");
 				return "close";
 			} catch (error) {
 				notify(ctx, errorMessage(error), "warning");
@@ -922,8 +1032,7 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 			}
 		}
 
-		const focusedForAction = getFocusedExploration(state);
-		if (action === "accept" && focusedForAction !== undefined && focusedForAction.id.toUpperCase() === normalizeDecisionId(id)) {
+		if (reviewingFocusedProposal) {
 			const confirmed = await ctx.ui.confirm("Review proposal?", "Open the Markdown review before resolving this focused exploration?");
 			if (!confirmed) {
 				notify(ctx, "Acceptance cancelled.", "info");
@@ -932,8 +1041,8 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 			return (await reviewAndReturnProposal(ctx)) === "resolved" ? "close" : "stay";
 		}
 
-		if (action === "accept" || action === "ignore" || action === "remove") {
-			const label = action === "accept" ? "Accept proposal?" : action === "ignore" ? "Ignore decision?" : "Remove decision?";
+		if (action === "accept" || action === "reject" || action === "ignore" || action === "remove") {
+			const label = action === "accept" ? "Accept proposal?" : action === "reject" ? "Reject proposal?" : action === "ignore" ? "Ignore decision?" : "Remove decision?";
 			const description = action === "remove"
 				? `Remove ${formatDecisionIdForTui(normalizeDecisionId(id))} from the current branch? Earlier snapshots remain unchanged.`
 				: `Apply ${action} to ${formatDecisionIdForTui(normalizeDecisionId(id))}?`;
@@ -947,7 +1056,7 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 			state = applyDecisionAction(state, id, action);
 			appendSnapshot(pi, state, "command");
 			refreshWidget(state, ctx);
-			const actionVerb: Record<DecisionAction, string> = { explore: "Explored", accept: "Accepted", ignore: "Ignored", reopen: "Reopened", defer: "Deferred", remove: "Removed" };
+			const actionVerb: Partial<Record<DecisionAction, string>> = { explore: "Explored", accept: "Accepted", reject: "Rejected", ignore: "Ignored", reopen: "Reopened", defer: "Deferred", remove: "Removed" };
 			notify(ctx, `${actionVerb[action]} ${formatDecisionId(normalizeDecisionId(id))}.`, "info");
 			return "close";
 		} catch (error) {
@@ -1063,20 +1172,110 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 		refreshWidget(state, ctx);
 	});
 
+	function commitAdrState(ctx: ExtensionContext, next: LedgerState): void {
+		state = next;
+		appendSnapshot(pi, state, "command");
+		refreshWidget(state, ctx);
+	}
+
+	/** Exact body review, published only if the file still has the checked-out bytes. */
+	async function editAdr(ctx: ExtensionCommandContext, reference: string, relativePath: string): Promise<void> {
+		let body: string;
+		try {
+			body = await promotedDraftBody(state, reference);
+		} catch (error) {
+			notify(ctx, `Edit refused: ${errorMessage(error)}`, "warning");
+			return;
+		}
+		const reviewed = await ctx.ui.editor(`Edit draft ADR ${relativePath}`, body);
+		if (reviewed === undefined || reviewed === body) {
+			notify(ctx, reviewed === undefined ? "Edit cancelled; nothing was written." : "No changes; nothing was written.", "info");
+			return;
+		}
+		try {
+			const result = await editPromotedDecision(state, reference, reviewed);
+			if (result.ok) {
+				commitAdrState(ctx, result.state);
+				notify(ctx, `Updated draft ADR ${relativePath}.`);
+				return;
+			}
+			notify(ctx, `Edit refused (${result.conflict.reason}): ${relativePath} changed while you were editing. Your text was kept in the transcript; run /adr reload ${reference}, then edit again.`, "error");
+		} catch (error) {
+			notify(ctx, `Edit failed; your text was kept in the transcript: ${errorMessage(error)}`, "error");
+		}
+		// Never lose reviewed text that could not be published.
+		pi.sendMessage({
+			customType: ADR_EDIT_MESSAGE_TYPE,
+			content: `Unpublished edit of ADR ${reference} at ${relativePath}:\n\n${reviewed}`,
+			display: true,
+			details: { adr: reference, relativePath, markdown: reviewed },
+		}, { triggerTurn: false });
+	}
+
+	/** Adopt the file's current bytes as the working-copy base, only on request. */
+	async function reloadAdr(ctx: ExtensionCommandContext, reference: string, relativePath: string): Promise<void> {
+		try {
+			const review = await checkoutPromotedDecision(state, reference);
+			if (review.current) {
+				notify(ctx, `${relativePath} is unchanged; nothing to reload.`, "info");
+				return;
+			}
+			const confirmed = await ctx.ui.confirm(
+				"Review repository ADR before reload",
+				`Authoritative content for ${relativePath} (identity ${review.checkout.id}):\n\n${review.checkout.baseSource}\n\nAdopt only these reviewed bytes as the new base? The file itself will not be changed.`,
+			);
+			if (!confirmed) {
+				notify(ctx, "Reload cancelled.", "info");
+				return;
+			}
+			const result = await reloadPromotedDecision(state, reference, review.checkout.baseSourceFingerprint);
+			if (!result.changed) {
+				notify(ctx, `${relativePath} is unchanged; nothing to reload.`, "info");
+				return;
+			}
+			commitAdrState(ctx, result.state);
+			notify(ctx, `Reloaded ${relativePath} (ADR ${result.promotion.lifecycle}).`);
+		} catch (error) {
+			notify(ctx, `Reload refused: ${errorMessage(error)}`, "error");
+		}
+	}
+
+	/** Delete an unchanged draft and detach its sources so promotion can be retried. */
+	async function discardAdr(ctx: ExtensionCommandContext, reference: string, relativePath: string, sourceIds: readonly string[]): Promise<void> {
+		const confirmed = await ctx.ui.confirm(
+			"Discard draft ADR?",
+			`Delete the unchanged draft ${relativePath} and detach ${tuiDecisionIds(sourceIds)}. The decisions stay available for a later promotion.`,
+		);
+		if (!confirmed) {
+			notify(ctx, "Discard cancelled; nothing was changed.", "info");
+			return;
+		}
+		try {
+			const result = await discardPromotedDraft(state, reference);
+			commitAdrState(ctx, result.state);
+			notify(ctx, `Discarded draft ${relativePath} and detached ${sourceIds.map((sourceId) => formatDecisionId(sourceId)).join(", ")}.`);
+		} catch (error) {
+			notify(ctx, `Discard refused; nothing was changed: ${errorMessage(error)}`, "error");
+		}
+	}
+
 	pi.registerTool({
 		name: TOOL_NAME,
 		label: "Decision Ledger",
 		description:
-			"Manage the current session and conversation-branch decision ledger. Use list for a compact overview, detail for one full record, add to atomically add titled points (optionally with a user-supplied initial lifecycle and complete record), update to atomically apply changes, explore to start focused investigation, propose to save a lightweight or explored record draft, and remove to atomically remove requested items. Add defaults to open; exploring is not valid on add. Tool output is bounded; state is branch-aware.",
+			"Manage the current session and conversation-branch decision ledger. update changes only title and point; propose creates or revises a candidate; resolve records a direct user-approved outcome; accept and reject operate only on lightweight proposals; defer, ignore, and reopen manage canonical lifecycles; explore starts a bookmark and explored proposals must use /decision return; promote_adr opens mandatory interactive review of agent-synthesized Markdown and promotes only after user approval. Add and remove remain atomic where applicable. Tool output is bounded; state is branch-aware.",
 		promptSnippet: "Track user-resolvable decisions and compact decision records for this Pi session branch",
 		promptGuidelines: [
 			"Use decision_ledger action add once with all user-resolvable points before presenting two or more such points to the user.",
 			"For every decision_ledger add item, provide a minimal meaningful title, preferably a few words, and keep the complete precise decision point in point.",
 			"On add, omit lifecycle to default to open and never silently resolve a decision. Set proposed, resolved, deferred, or ignored only when the user already supplied or explicitly accepted that initial state; include a complete record for proposed, resolved, and ignored, and optionally for deferred. Never use exploring as an add lifecycle.",
-			"Use decision_ledger action update with one batch for resolutions that belong together; do not silently decide a point for the user.",
+			"Use decision_ledger action update only for title and/or point metadata; it never changes lifecycle or record.",
+			"Use decision_ledger action resolve only for a directly user-approved open decision and include a complete record.",
 			"Use decision_ledger action explore only when the user explicitly and unambiguously asks to explore a specific decision; ask for clarification when the target is ambiguous.",
-			"Use decision_ledger action propose on an open item for a lightweight proposal, or on the focused item after exploration; lightweight proposals resolve or return to open with update, while explored proposals finalize through /decision return.",
+			"Use decision_ledger action propose to create or revise a candidate. Lightweight proposals can be accepted or rejected; explored proposals must finalize through /decision return.",
+			"Use accept, reject, defer, ignore, or reopen explicitly for those transitions; active exploration must first use /decision return or /decision exit.",
 			"Use decision_ledger action remove only when the user explicitly requested removal, and set userRequested to true only for that request. Never remove the actively explored decision.",
+			"Use decision_ledger action promote_adr with ordered ids, the exact synthesized envelope-free MADR Markdown, and optional slug/repository. It opens mandatory exact Markdown review and writes only after user approval. Never bypass review. Session decision IDs belong only in provenance, not in the prose.",
 		],
 		parameters: DecisionLedgerParams,
 		executionMode: "sequential",
@@ -1167,7 +1366,7 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 						state = next;
 						refreshWidget(state, ctx);
 						return {
-							content: [{ type: "text", text: updateFeedback(state, params.updates as DecisionUpdateInput[]) }],
+							content: [{ type: "text", text: updateFeedback(params.updates as DecisionUpdateInput[]) }],
 							details: makeDetails(params.action, state, {
 								updatedIds: params.updates.map((update) => normalizeDecisionId(update.id)),
 							}),
@@ -1180,14 +1379,66 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 						const id = normalizeDecisionId(params.id);
 						const item = state.ledger?.items.find((candidate) => candidate.id.toUpperCase() === id);
 						if (item === undefined) throw new Error(`${formatDecisionId(params.id)} was not found in the current ledger`);
-						const markdown = renderDecisionRecordMarkdown(item, params.record as DecisionRecord);
-						const next = proposeDecisionRecord(state, id, params.record as DecisionRecord, markdown);
+						const next = proposeDecisionRecord(state, id, params.record as DecisionRecord);
 						state = next;
+						const markdown = next.ledger?.items.find((candidate) => candidate.id === id)?.proposalMarkdown ?? "";
 						refreshWidget(state, ctx);
 						return {
 							content: [{ type: "text", text: boundLedgerOutput(markdown, 12000) }],
-							details: makeDetails(params.action, state),
+							details: makeDetails(params.action, state, { updatedIds: [id] }),
 						};
+					}
+
+					case "resolve": {
+						if (params.id === undefined) throw new Error("id is required for resolve");
+						if (params.record === undefined) throw new Error("record is required for resolve");
+						const id = normalizeDecisionId(params.id);
+						state = resolveDecision(state, id, params.record as DecisionRecord);
+						refreshWidget(state, ctx);
+						return { content: [{ type: "text", text: formatReturnReceipt(id, (params.record as DecisionRecord).decision) }], details: makeDetails(params.action, state, { updatedIds: [id] }) };
+					}
+
+					case "promote_adr": {
+						if (params.ids === undefined || params.ids.length === 0) throw new Error("ids are required for promote_adr");
+						if (params.markdown === undefined) throw new Error("markdown is required for promote_adr");
+						if (!ctx.hasUI) throw new Error("promote_adr requires interactive review");
+						const sourceIds = collectPromotionSources(state, params.ids).map((source) => source.id);
+						const repositoryRoot = await resolveGitRepositoryRoot(ctx.cwd, params.repository);
+						const reviewedBody = await ctx.ui.editor("Review exact ADR Markdown", params.markdown);
+						if (reviewedBody === undefined) {
+							return {
+								content: [{ type: "text", text: "ADR promotion cancelled. Nothing was written." }],
+								details: makeDetails(params.action, state),
+							};
+						}
+						const outcome = await promoteReviewedBody(state, {
+							repositoryRoot,
+							reviewedBody,
+							sourceIds,
+							...(params.slug === undefined ? {} : { slug: params.slug }),
+						});
+						state = outcome.state;
+						refreshWidget(state, ctx);
+						return {
+							content: [{ type: "text", text: `Promoted ${sourceIds.map((id) => formatDecisionId(id)).join(", ")} to ADR ${outcome.promotion.slug} at ${outcome.absolutePath}.` }],
+							details: makeDetails(params.action, state, { updatedIds: [...sourceIds] }),
+						};
+					}
+
+					case "accept":
+					case "reject":
+					case "defer":
+					case "ignore":
+					case "reopen": {
+						if (params.id === undefined) throw new Error(`id is required for ${params.action}`);
+						const id = normalizeDecisionId(params.id);
+						state = applyDecisionAction(state, id, params.action);
+						refreshWidget(state, ctx);
+						const item = state.ledger?.items.find((candidate) => candidate.id === id);
+						const text = params.action === "accept"
+							? formatReturnReceipt(id, item?.record?.decision ?? item?.point ?? "")
+							: `${params.action[0]!.toUpperCase()}${params.action.slice(1)} ${formatDecisionId(id)}.`;
+						return { content: [{ type: "text", text }], details: makeDetails(params.action, state, { updatedIds: [id] }) };
 					}
 				}
 			} catch (error) {
@@ -1214,15 +1465,19 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 			if (details.error) return new Text(theme.fg("error", styleDecisionReferences(`Error: ${details.error}`, theme)), 0, 0);
 			if (details.action === "list") return new Text(styleDecisionReferences(formatDecisionOverview(details.state), theme), 0, 0);
 			if (details.action === "detail") return new Text(styleDecisionReferences(resultText(result), theme), 0, 0);
-			if (details.action === "propose" && expanded && details.state.proposal) {
-				return new Text(styleDecisionReferences(details.state.proposal.markdown, theme), 0, 0);
+			if (details.action === "propose" && expanded && details.state.ledger !== undefined) {
+				const proposedId = details.updatedIds?.[0];
+				const proposal = proposedId === undefined
+					? undefined
+					: details.state.ledger.items.find((item) => item.id.toUpperCase() === proposedId.toUpperCase())?.proposalMarkdown;
+				if (proposal !== undefined) return new Text(styleDecisionReferences(proposal, theme), 0, 0);
 			}
 			return new Text(theme.fg("success", styleDecisionReferences(resultText(result), theme)), 0, 0);
 		},
 	});
 
 	pi.registerCommand("decisions", {
-		description: "Show, export, or recover the current-branch decision ledger",
+		description: "Show, export, recover, or carry the current-branch decision ledger into a new session",
 		getArgumentCompletions: (prefix) => completeDecisionsCommandArguments(prefix),
 		handler: async (args, ctx) => {
 			const command = args.trim().toLowerCase();
@@ -1246,15 +1501,43 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 				}
 				return;
 			}
+			if (command === "new") {
+				if (state.ledger === undefined) {
+					notify(ctx, "There is no active decision ledger to carry into a new session.", "warning");
+					return;
+				}
+				const focused = getFocusedExploration(state);
+				if (focused !== undefined) {
+					notify(ctx, `Finish or exit exploration ${formatDecisionId(focused.id)} before starting a new session.`, "warning");
+					return;
+				}
+				const handoffState = cloneState(state);
+				try {
+					const result = await ctx.newSession({
+						setup: async (sessionManager) => {
+							sessionManager.appendCustomEntry(CUSTOM_ENTRY_TYPE, {
+								extension: CUSTOM_ENTRY_TYPE,
+								version: 1,
+								source: "session_handoff",
+								state: handoffState,
+							} satisfies LedgerCustomEntryData);
+						},
+						withSession: async (freshContext) => {
+							notify(freshContext, `Started a new session with ${handoffState.ledger?.items.length ?? 0} decision(s).`);
+						},
+					});
+					if (result.cancelled) notify(ctx, "New session cancelled.", "info");
+				} catch (error) {
+					notify(ctx, `Could not start the ledger-aware session: ${errorMessage(error)}`, "error");
+				}
+				return;
+			}
 			if (command !== "recover") {
 				notify(ctx, DECISIONS_USAGE, "warning");
 				return;
 			}
 
-			if (state.ledger !== undefined) {
-				notify(ctx, "Cannot recover into a branch that already has a decision ledger.", "warning");
-				return;
-			}
+			const currentItemCount = state.ledger?.items.length ?? 0;
 			const branch = ctx.sessionManager.getBranch();
 			const candidate = findNewestOffBranchSnapshot(
 				ctx.sessionManager.getEntries(),
@@ -1268,10 +1551,11 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 				notify(ctx, "Recovery requires explicit interactive confirmation.", "warning");
 				return;
 			}
-			const confirmed = await ctx.ui.confirm(
-				"Recover decision ledger?",
-				`Copy the whole snapshot from ${candidate.state.ledger?.items.length ?? 0} item(s) on another branch?`,
-			);
+			const recoveredItemCount = candidate.state.ledger?.items.length ?? 0;
+			const replacement = state.ledger === undefined
+				? `Copy the whole snapshot from ${recoveredItemCount} item(s) on another branch?`
+				: `Completely replace/overwrite the current branch ledger (${currentItemCount} item(s)) with the ${recoveredItemCount}-item snapshot from another branch. This will not merge them.`;
+			const confirmed = await ctx.ui.confirm("Recover decision ledger?", replacement);
 			if (!confirmed) {
 				notify(ctx, "Recovery cancelled.", "info");
 				return;
@@ -1279,12 +1563,77 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 			state = cloneState(candidate.state);
 			appendSnapshot(pi, state, "recovery");
 			refreshWidget(state, ctx);
-			notify(ctx, `Recovered the decision ledger from off-branch snapshot ${candidate.entryId}.`);
+			notify(ctx, `Recovered and replaced the current decision ledger with off-branch snapshot ${candidate.entryId}.`);
+		},
+	});
+
+	pi.registerCommand("adrs", {
+		description: "List repository ADRs attached to this session",
+		handler: async (_args, ctx) => {
+			const adrs = state.adrs ?? [];
+			const markdown = adrs.length === 0
+				? "# ADRs\n\nNo repository ADRs are registered in this session."
+				: ["# ADRs", "", "| Slug | Status | File | Sources |", "| --- | --- | --- | --- |", ...adrs.map((adr) => `| \`${adr.slug}\` | ${adr.lifecycle} | \`${adr.relativePath}\` | ${adr.sourceDecisionIds.map((id) => formatDecisionId(id)).join(", ")} |`)].join("\n");
+			if (ctx.hasUI) pi.sendMessage({ customType: DECISION_OVERVIEW_MESSAGE_TYPE, content: markdown, display: true }, { triggerTurn: false });
+			else console.log(markdown);
+		},
+	});
+
+	pi.registerCommand("adr", {
+		description: "Edit, reload, discard, or accept a repository ADR by slug",
+		getArgumentCompletions: (prefix) => {
+			const trimmed = prefix.trimStart();
+			const firstSpace = trimmed.indexOf(" ");
+			const action = firstSpace === -1 ? trimmed : trimmed.slice(0, firstSpace);
+			if (!(ADR_ACTIONS as readonly string[]).includes(action)) {
+				return ADR_ACTIONS.filter((candidate) => candidate.startsWith(action)).map((candidate) => ({ value: `${candidate} `, label: candidate, description: `ADR ${candidate}` }));
+			}
+			const partial = firstSpace === -1 ? "" : trimmed.slice(firstSpace + 1).trimStart().toLowerCase();
+			return (state.adrs ?? [])
+				.filter((adr) => (action === "reload" || adr.lifecycle === "draft") && adr.slug.toLowerCase().startsWith(partial))
+				.map((adr) => ({ value: `${action} ${adr.slug}`, label: adr.slug, description: `${adr.lifecycle} · ${adr.relativePath}` }));
+		},
+		handler: async (args, ctx) => {
+			const [action, reference, ...extra] = args.trim().split(/\s+/).filter(Boolean);
+			if (!(ADR_ACTIONS as readonly string[]).includes(action ?? "") || reference === undefined || extra.length > 0) {
+				notify(ctx, ADR_USAGE, "warning");
+				return;
+			}
+			const promotion = findRegisteredAdr(state, reference);
+			if (promotion === undefined) {
+				notify(ctx, `Unknown ADR slug: ${reference}. Run /adrs to list available ADRs.`, "warning");
+				return;
+			}
+			if (!ctx.hasUI) {
+				notify(ctx, `/adr ${action} requires interactive review or confirmation.`, "warning");
+				return;
+			}
+			if (action === "edit") await editAdr(ctx, promotion.slug, promotion.relativePath);
+			else if (action === "reload") await reloadAdr(ctx, promotion.slug, promotion.relativePath);
+			else if (action === "discard") await discardAdr(ctx, promotion.slug, promotion.relativePath, promotion.sourceDecisionIds);
+			else {
+				const confirmed = await ctx.ui.confirm("Accept durable ADR?", `Mark ${promotion.relativePath} accepted. Accepted ADRs are immutable; a substantive change then needs a successor ADR.`);
+				if (!confirmed) {
+					notify(ctx, "Acceptance cancelled.", "info");
+					return;
+				}
+				try {
+					const result = await acceptPromotedDecision(state, promotion.slug);
+					if (!result.ok) {
+						notify(ctx, `Acceptance refused (${result.conflict.reason}): ${promotion.relativePath} changed. Run /adr reload ${promotion.slug} after reviewing it.`, "error");
+						return;
+					}
+					commitAdrState(ctx, result.state);
+					notify(ctx, result.changed ? `Accepted ADR ${promotion.slug}.` : `ADR ${promotion.slug} was already accepted.`);
+				} catch (error) {
+					notify(ctx, `Acceptance failed: ${errorMessage(error)}`, "error");
+				}
+			}
 		},
 	});
 
 	pi.registerCommand("decision", {
-		description: `Capture, explore, remove, return, or exit decision exploration (${DECISION_COMMANDS.join(" | ")})`,
+		description: `Capture, explore, promote to repository ADRs, remove, return, or exit decision exploration (${DECISION_COMMANDS.join(" | ")})`,
 		getArgumentCompletions: (prefix) =>
 			completeDecisionCommandArguments(prefix, state.ledger?.items ?? []),
 		handler: async (args, ctx) => {
@@ -1327,14 +1676,63 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 					if (nextFocus === undefined) throw new Error("exploration focus was not recorded");
 					appendFocusStateTransition(nextState, previousFocus === undefined ? "started" : "switched", nextFocus);
 					refreshWidget(state, ctx);
-					notify(
-						ctx,
-						`Exploring ${formatDecisionId(id)}. Return with /decision return after proposing a record. /tree changes conversation state only; filesystem changes are not reverted.`,
-						"warning",
-					);
 				} catch (error) {
 					notify(ctx, errorMessage(error), "warning");
 				}
+				return;
+			}
+
+			if (subcommand === "promote" && parts.length >= 2) {
+				if (!ctx.hasUI) {
+					notify(ctx, "Promotion requires interactive Markdown review.", "warning");
+					return;
+				}
+				let ids: string[];
+				let body: string;
+				let repositoryRoot: string;
+				let requestedSlug: string | undefined;
+				try {
+					const parsed = parsePromoteArguments(args.trim().slice(parts[0]!.length));
+					ids = parsed.ids;
+					requestedSlug = parsed.slug;
+					// Validate the source set, the candidate and the repository before
+					// offering a review that could not be written anyway.
+					body = promotionReviewBody(state, ids).body;
+					repositoryRoot = await resolveGitRepositoryRoot(ctx.cwd, parsed.repository);
+				} catch (error) {
+					notify(ctx, errorMessage(error), "warning");
+					return;
+				}
+				const reviewed = await ctx.ui.editor(`Review durable ADR draft for ${tuiDecisionIds(ids)} (repository ${repositoryRoot})`, body);
+				if (reviewed === undefined) {
+					notify(ctx, "Promotion cancelled; nothing was written.", "info");
+					return;
+				}
+				try {
+					// The reviewed text is the only input to validation, the semantic
+					// digest and the written file. A failure writes nothing and leaves
+					// the ledger without a durable identity.
+					const outcome = await promoteReviewedBody(state, {
+						repositoryRoot,
+						reviewedBody: reviewed,
+						sourceIds: ids,
+						...(requestedSlug === undefined ? {} : { slug: requestedSlug }),
+					});
+					state = outcome.state;
+					appendSnapshot(pi, state, "command");
+					refreshWidget(state, ctx);
+					notify(
+						ctx,
+						`Promoted ${ids.map((id) => formatDecisionId(id)).join(", ")} to ADR ${outcome.promotion.slug} at ${outcome.absolutePath}; use /adr commands from now on.`,
+					);
+				} catch (error) {
+					notify(ctx, `Promotion failed; nothing was written: ${errorMessage(error)}`, "error");
+				}
+				return;
+			}
+
+			if (["edit-adr", "reload-adr", "discard-adr", "accept-adr"].includes(subcommand ?? "")) {
+				notify(ctx, "ADR operations moved to /adr and use the ADR slug. Run /adrs to list available ADRs.", "warning");
 				return;
 			}
 

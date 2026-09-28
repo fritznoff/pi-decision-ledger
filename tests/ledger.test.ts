@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import decisionLedgerExtension from "../extensions/index.ts";
+import { createDurableAdrFromBody } from "../src/durable.ts";
 import { matchesKey, stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import {
 	DECISION_COMMANDS,
@@ -48,7 +49,8 @@ import {
 	orderDecisionItems,
 	orderActionableDecisionItems,
 	replayLedgerBranch,
-	resolveDecisionRecord,
+	finalizeExploredProposal,
+	resolveDecision,
 	renderDecisionRecordMarkdown,
 	startExploration,
 	switchExploration,
@@ -148,51 +150,47 @@ describe("decision IDs and state transitions", () => {
 		expect(MAX_DECISION_ID_ATTEMPTS).toBeGreaterThan(0);
 	});
 
-	it("applies updates atomically without assuming a sequential ID format", () => {
+	it("applies metadata updates atomically without assuming a sequential ID format", () => {
 		const initial = stateWithItems("ABC", "XYZ");
 		const updated = applyBatchUpdates(initial, [
-			{ id: "abc", lifecycle: "resolved", record },
-			{ id: "XYZ", lifecycle: "deferred" },
+			{ id: "abc", title: "First", point: "Updated first" },
+			{ id: "XYZ", title: "Second" },
 		]);
 
-		expect(updated.ledger?.items.map((item) => [item.id, item.lifecycle])).toEqual([
-			["ABC", "resolved"],
-			["XYZ", "deferred"],
+		expect(updated.ledger?.items.map((item) => [item.id, item.title, item.point])).toEqual([
+			["ABC", "First", "Updated first"],
+			["XYZ", "Second", "Point 2"],
 		]);
 
-		expect(() => applyBatchUpdates(updated, [{ id: "ABC", lifecycle: "open" }, { id: "ZZZ", lifecycle: "resolved" }])).toThrow(
+		expect(() => applyBatchUpdates(updated, [{ id: "ABC", point: "Would change" }, { id: "ZZZ", title: "Missing" }])).toThrow(
 		"`ZZZ` was not found in the current ledger",
 	);
-		expect(updated.ledger?.items[0]?.lifecycle).toBe("resolved");
+		expect(updated.ledger?.items[0]?.point).toBe("Updated first");
+		expect(() => applyBatchUpdates(updated, [{ id: "ABC", lifecycle: "resolved" } as never])).toThrow("only title and point");
 	});
 
-	it("keeps explored proposal finalization separate from ordinary updates", () => {
+	it("keeps explored proposal finalization separate from metadata updates", () => {
 		const open = stateWithItems("ABC", "XYZ");
 		const exploring = startExploration(open, "ABC", "entry-1", "decision-return-ABC");
-		expect(exploring.ledger?.items[0]?.lifecycle).toBe("exploring");
-		expect(() => applyBatchUpdates(exploring, [{ id: "ABC", lifecycle: "exploring" }])).toThrow(
-		"must be started with /decision explore",
-	);
-		expect(() => applyBatchUpdates(exploring, [{ id: "ABC", lifecycle: "proposed" }])).toThrow(
-		"must be proposed with decision_ledger propose",
-	);
-		expect(() => applyBatchUpdates(exploring, [{ id: "ABC", lifecycle: "resolved" }])).toThrow(
-		"must be finalized with /decision return",
-	);
+		expect(exploring.ledger?.items[0]?.lifecycle).toBe("open");
+		expect(exploring.ledger?.items[0]?.exploration).toBeDefined();
+		const renamed = applyBatchUpdates(exploring, [{ id: "ABC", title: "Focused" }]);
+		expect(renamed.ledger?.items[0]?.title).toBe("Focused");
+		expect(() => resolveDecision(renamed, "ABC", record)).toThrow("actively explored");
 
-		const markdown = renderDecisionRecordMarkdown(exploring.ledger!.items[0]!, record);
-		const proposed = proposeDecisionRecord(exploring, "ABC", record, markdown);
+		const markdown = renderDecisionRecordMarkdown(renamed.ledger!.items[0]!, record);
+		const proposed = proposeDecisionRecord(renamed, "ABC", record, markdown);
 		expect(proposed.ledger?.items[0]?.lifecycle).toBe("proposed");
 		expect(proposed.ledger?.items[0]?.exploration).toBeDefined();
-		expect(proposed.proposal?.markdown).toBe(markdown);
+		expect(getDecisionProposal(proposed, "ABC")?.markdown).toBe(markdown);
 
-		const resolved = resolveDecisionRecord(proposed, "ABC", record);
+		const resolved = finalizeExploredProposal(proposed, "ABC", record);
 		expect(resolved.ledger?.items[0]?.lifecycle).toBe("resolved");
 		expect(resolved.ledger?.items[0]?.exploration).toBeUndefined();
-		expect(resolved.proposal).toBeUndefined();
+		expect(getDecisionProposal(resolved, "ABC")).toBeUndefined();
 	});
 
-	it("supports lightweight proposals through explicit update transitions", () => {
+	it("supports lightweight proposals through explicit accept and reject transitions", () => {
 		const open = stateWithItems("ABC");
 		const markdown = renderDecisionRecordMarkdown(open.ledger!.items[0]!, record);
 		const proposed = proposeDecisionRecord(open, "ABC", record, markdown);
@@ -200,23 +198,21 @@ describe("decision IDs and state transitions", () => {
 		expect(proposed.ledger?.items[0]?.lifecycle).toBe("proposed");
 		expect(proposed.ledger?.items[0]?.exploration).toBeUndefined();
 		const exploredProposal = startExploration(proposed, "ABC", "entry", "return");
-		expect(exploredProposal.ledger?.items[0]?.lifecycle).toBe("exploring");
+		expect(exploredProposal.ledger?.items[0]?.lifecycle).toBe("proposed");
 		expect(exploredProposal.ledger?.items[0]?.record).toEqual(record);
-		expect(exploredProposal.proposal).toEqual(proposed.proposal);
 		const exitedProposal = exitExploration(exploredProposal, "ABC");
 		expect(exitedProposal.ledger?.items[0]?.lifecycle).toBe("proposed");
 		expect(exitedProposal.ledger?.items[0]?.record).toEqual(record);
-		expect(exitedProposal.proposal).toEqual(proposed.proposal);
 
-		const rejected = applyBatchUpdates(proposed, [{ id: "ABC", lifecycle: "open" }]);
+		const rejected = applyDecisionAction(proposed, "ABC", "reject");
 		expect(rejected.ledger?.items[0]?.lifecycle).toBe("open");
 		expect(rejected.ledger?.items[0]?.record).toBeUndefined();
-		expect(rejected.proposal).toBeUndefined();
+		expect(getDecisionProposal(rejected, "ABC")).toBeUndefined();
 
-		const accepted = applyBatchUpdates(proposed, [{ id: "ABC", lifecycle: "resolved" }]);
+		const accepted = applyDecisionAction(proposed, "ABC", "accept");
 		expect(accepted.ledger?.items[0]?.lifecycle).toBe("resolved");
 		expect(accepted.ledger?.items[0]?.record).toEqual(record);
-		expect(accepted.proposal).toBeUndefined();
+		expect(getDecisionProposal(accepted, "ABC")).toBeUndefined();
 	});
 
 	it("allows explicit exploration exit and switching while preserving one focus", () => {
@@ -245,21 +241,23 @@ describe("decision IDs and state transitions", () => {
 		expect(() => removeDecisionItems(focused, ["ABC"])).toThrow("actively explored");
 	});
 
-	it("gives ignored lifecycle precedence over resolved presentation", () => {
+	it("gives focus and ignored lifecycle the right presentation precedence", () => {
 		expect(decisionStatePresentation({ lifecycle: "open" })).toEqual({
 			symbol: "○",
 			kind: "open",
+			focused: false,
 			ignored: false,
 			dimmed: false,
 			bold: false,
 		});
-		expect(decisionStatePresentation({ lifecycle: "exploring" })).toMatchObject({ symbol: "◉", bold: true });
+		expect(decisionStatePresentation({ lifecycle: "open", exploration: { returnEntryId: "entry", returnLabel: "return", origin: "open" } })).toMatchObject({ symbol: "◉", focused: true, bold: true });
 		expect(decisionStatePresentation({ lifecycle: "proposed" })).toMatchObject({ symbol: "◇" });
 		expect(decisionStatePresentation({ lifecycle: "resolved" })).toMatchObject({ symbol: "✓", dimmed: true });
 		expect(decisionStatePresentation({ lifecycle: "deferred" })).toMatchObject({ symbol: "⏸", dimmed: true });
 		expect(decisionStatePresentation({ lifecycle: "ignored" })).toEqual({
 			symbol: "−",
 			kind: "ignored",
+			focused: false,
 			ignored: true,
 			dimmed: true,
 			bold: false,
@@ -361,7 +359,7 @@ describe("initial add lifecycle matrix", () => {
 		const revisedRecord = { ...recordA, decision: "Use revised approach A." };
 		const revisedMarkdown = renderDecisionRecordMarkdown(exited.ledger!.items[0]!, revisedRecord);
 		const revised = proposeDecisionRecord(exited, itemA!.id, revisedRecord, revisedMarkdown);
-		const accepted = applyBatchUpdates(revised, [{ id: itemA!.id, lifecycle: "resolved" }]);
+		const accepted = applyDecisionAction(revised, itemA!.id, "accept");
 		expect(accepted.ledger?.items[0]?.record).toEqual(revisedRecord);
 		expect(accepted.ledger?.items[0]?.proposalMarkdown).toBeUndefined();
 		expect(getDecisionProposal(accepted, itemB!.id)?.markdown).toBe(markdownB);
@@ -446,7 +444,7 @@ describe("resolved lifecycle model and migrations", () => {
 		const cloned = cloneState(legacyRuntimeState);
 		expect(JSON.stringify(cloned)).not.toContain("disposition");
 		expect(formatDecisionExport(cloned)).not.toContain("Disposition:");
-		expect(LIFECYCLES).toEqual(["open", "exploring", "proposed", "resolved", "deferred", "ignored"]);
+		expect(LIFECYCLES).toEqual(["open", "proposed", "resolved", "deferred", "ignored"]);
 	});
 
 	it("covers terminal, reopening, and active-exploration transition guards", () => {
@@ -460,10 +458,10 @@ describe("resolved lifecycle model and migrations", () => {
 		const deferred = applyDecisionAction(reopened, "ABC", "defer");
 		expect(deferred.ledger?.items[0]?.lifecycle).toBe("deferred");
 		const openAgain = applyDecisionAction(deferred, "ABC", "reopen");
-		const resolved = applyBatchUpdates(openAgain, [{ id: "ABC", lifecycle: "resolved", record }]);
+		const resolved = resolveDecision(openAgain, "ABC", record);
 		expect(isDecisionCompleted(resolved.ledger!.items[0]!)).toBe(true);
-		expect(decisionActionReason(resolved, "ABC", "ignore")).toContain("already resolved");
-		expect(() => applyDecisionAction(resolved, "ABC", "ignore")).toThrow("already resolved");
+		expect(decisionActionReason(resolved, "ABC", "ignore")).toContain("reopen");
+		expect(() => applyDecisionAction(resolved, "ABC", "ignore")).toThrow("reopen");
 
 		const focused = startExploration(openAgain, "ABC", "entry", "return");
 		expect(decisionActionReason(focused, "ABC", "remove")).toContain("actively explored");
@@ -490,7 +488,7 @@ describe("proposal exploration lifecycle", () => {
 		const proposed = proposeDecisionRecord(open, "ABC", record, initialMarkdown);
 		const focused = startExploration(proposed, "ABC", "entry-1", "return-ABC");
 		expect(focused.ledger?.items[0]?.exploration?.origin).toBe("proposed");
-		const acceptedUnchanged = resolveDecisionRecord(focused, "ABC", record);
+		const acceptedUnchanged = finalizeExploredProposal(focused, "ABC", record);
 		expect(acceptedUnchanged.ledger?.items[0]?.lifecycle).toBe("resolved");
 		expect(acceptedUnchanged.ledger?.items[0]?.record).toEqual(record);
 		expect(acceptedUnchanged.proposal).toBeUndefined();
@@ -504,7 +502,7 @@ describe("proposal exploration lifecycle", () => {
 		const revised = proposeDecisionRecord(exited, "ABC", revisedRecord, revisedMarkdown);
 		const revisedFocus = startExploration(revised, "ABC", "entry-2", "return-ABC");
 		const revisedExit = exitExploration(revisedFocus, "ABC");
-		expect(revisedExit.proposal?.markdown).toBe(revisedMarkdown);
+		expect(getDecisionProposal(revisedExit, "ABC")?.markdown).toBe(revisedMarkdown);
 		expect(revisedExit.ledger?.items[0]?.record).toEqual(revisedRecord);
 	});
 
@@ -526,13 +524,13 @@ describe("proposal exploration lifecycle", () => {
 		const proposedBoth = proposeDecisionRecord(proposedA, "XYZ", recordB, "draft-B");
 		const focusedA = startExploration(proposedBoth, "ABC", "entry-A", "return-ABC");
 
-		expect(focusedA.proposal?.itemId).toBe("ABC");
+		expect(getFocusedExploration(focusedA)?.id).toBe("ABC");
 		expect(getDecisionProposal(focusedA, "ABC")?.markdown).toBe("draft-A");
 		expect(getDecisionProposal(focusedA, "XYZ")?.markdown).toBe("draft-B");
 
 		const exitedA = exitExploration(focusedA, "ABC");
 		const focusedB = startExploration(exitedA, "XYZ", "entry-B", "return-XYZ");
-		expect(focusedB.proposal?.itemId).toBe("XYZ");
+		expect(getFocusedExploration(focusedB)?.id).toBe("XYZ");
 		const focusedAgainA = switchExploration(focusedB, "ABC", "entry-A-2", "return-ABC-2");
 		expect(getDecisionProposal(focusedAgainA, "ABC")?.markdown).toBe("draft-A");
 		expect(getDecisionProposal(focusedAgainA, "XYZ")?.markdown).toBe("draft-B");
@@ -540,7 +538,7 @@ describe("proposal exploration lifecycle", () => {
 		expect(getDecisionProposal(replayed, "ABC")?.markdown).toBe("draft-A");
 		expect(getDecisionProposal(replayed, "XYZ")?.markdown).toBe("draft-B");
 
-		const resolvedA = resolveDecisionRecord(focusedAgainA, "ABC", recordA);
+		const resolvedA = finalizeExploredProposal(focusedAgainA, "ABC", recordA);
 		expect(getDecisionProposal(resolvedA, "ABC")).toBeUndefined();
 		expect(getDecisionProposal(resolvedA, "XYZ")?.markdown).toBe("draft-B");
 	});
@@ -571,7 +569,7 @@ describe("formatting and command completion", () => {
 		const item = titled.ledger!.items[0]!;
 		expect(item.title).toBe("Choose API");
 		expect(decisionDisplayTitle(item)).toBe("Choose API");
-		expect(formatDecisionOverview(titled)).toContain("| `ABC` | open | Choose API |");
+		expect(formatDecisionOverview(titled)).toContain("| `ABC` | open | — | Choose API |");
 		expect(formatDecisionOverview(titled)).not.toContain("Choose the narrow or broad API for every caller.");
 		expect(formatDecisionDetail(titled, "ABC")).toContain("Title: Choose API");
 		expect(formatDecisionDetail(titled, "ABC")).toContain("Choose the narrow or broad API for every caller.");
@@ -579,7 +577,7 @@ describe("formatting and command completion", () => {
 
 		const legacy = { id: "XYZ", point: "Legacy complete point", lifecycle: "open" as const };
 		expect(decisionDisplayTitle(legacy)).toBe(legacy.point);
-		expect(formatDecisionOverview({ ledger: { items: [legacy] } })).toContain("| `XYZ` | open | Legacy complete point |");
+		expect(formatDecisionOverview({ ledger: { items: [legacy] } })).toContain("| `XYZ` | open | — | Legacy complete point |");
 	});
 
 	it("centralizes distinct Markdown and TUI ID formatting without changing the raw ID", () => {
@@ -607,11 +605,41 @@ describe("formatting and command completion", () => {
 		expect(rendered).not.toContain("Long 日本語 title that must fit");
 	});
 
+	it("renders only the focused decision with its title and exploration indicator", () => {
+		const theme: any = {
+			fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+			bold: (text: string) => `<bold>${text}</bold>`,
+			strikethrough: (text: string) => `<strike>${text}</strike>`,
+		};
+		const state = addDecisionItems(emptyLedgerState(), [
+			{ title: "Focused choice", point: "Investigate the focused choice" },
+			{ title: "Other choice", point: "Investigate the other choice" },
+		], { randomBytes: randomBytesForIds("ABC", "XYZ") });
+		const focused = startExploration(state, "ABC", "entry", "return-ABC");
+		const lines = new DecisionWidget(focused, theme).render(160);
+		const rendered = lines.join("\\n");
+
+		expect(lines).toHaveLength(2);
+		expect(rendered).toContain("[ABC]");
+		expect(rendered).toContain("Focused choice");
+		expect(rendered).toContain("Exploring");
+		expect(rendered).not.toContain("[XYZ]");
+		expect(rendered).not.toContain("Other choice");
+		expect(rendered).not.toContain("Focused:");
+		for (const width of [0, 8, 24, 80]) {
+			for (const line of new DecisionWidget(focused, theme).render(width)) {
+				expect(visibleWidth(line)).toBeLessThanOrEqual(width);
+			}
+		}
+		expect(formatDecisionOverview(focused)).toContain("| `ABC` |");
+		expect(formatDecisionOverview(focused)).toContain("XYZ");
+	});
+
 	it("renders an interactive detail body without duplicate metadata or record sections", () => {
 		const titled = addDecisionItems(emptyLedgerState(), [{ title: "Choose API", point: "Complete point" }], {
 			randomBytes: randomBytesForIds("ABC"),
 		});
-		const resolved = applyBatchUpdates(titled, [{ id: "ABC", lifecycle: "resolved", record }]);
+		const resolved = resolveDecision(titled, "ABC", record);
 		const detail = formatDecisionDetail(resolved, "ABC");
 		expect(detail.match(/### Point/g)).toHaveLength(1);
 		expect(detail.match(/### Context/g)).toHaveLength(1);
@@ -623,11 +651,11 @@ describe("formatting and command completion", () => {
 	});
 
 	it("formats a compact overview and textual detail", () => {
-		const resolved = applyBatchUpdates(stateWithItems("ABC"), [{ id: "ABC", lifecycle: "resolved", record }]);
+		const resolved = resolveDecision(stateWithItems("ABC"), "ABC", record);
 		const overview = formatDecisionOverview(resolved);
 		const detail = formatDecisionDetail(resolved, "abc");
 
-		expect(overview).toContain("| `ABC` | resolved | Point 1 |");
+		expect(overview).toContain("| `ABC` | resolved | — | Point 1 |");
 		expect(overview).not.toContain("Use the narrow API.");
 		expect(formatLedgerMarkdown(resolved)).not.toContain("Use the narrow API.");
 		expect(detail).toContain("Use the narrow API.");
@@ -654,9 +682,26 @@ describe("formatting and command completion", () => {
 		expect(completeDecisionCommandArguments("remove ", items)?.map((item) => item.value)).toEqual(["remove ABC", "remove XYZ"]);
 		expect(completeDecisionCommandArguments("remove ABC ", items)?.map((item) => item.value)).toEqual(["remove ABC XYZ"]);
 		expect(completeDecisionCommandArguments("explore ABC ", items)).toBeNull();
-		expect(completeDecisionsCommandArguments("")?.map((item) => item.value)).toEqual(["recover", "export"]);
+		expect(completeDecisionCommandArguments("promote ABC ", items)?.map((item) => item.value)).toEqual(["promote ABC XYZ"]);
+		expect(completeDecisionCommandArguments("accept-adr ", items)).toBeNull();
+		expect(completeDecisionCommandArguments("accept-adr ABC ", items)).toBeNull();
+		expect(completeDecisionCommandArguments("capture ", items)).toBeNull();
+		expect(completeDecisionsCommandArguments("")?.map((item) => item.value)).toEqual(["new", "recover", "export"]);
+		expect(completeDecisionsCommandArguments("new")?.[0]?.value).toBe("new");
 		expect(completeDecisionsCommandArguments("rec")?.[0]?.value).toBe("recover");
 		expect(completeDecisionsCommandArguments("exp")?.[0]?.value).toBe("export");
+	});
+
+	it("keeps ADR operations out of decision completion and offers promotion flags", () => {
+		const items = [
+			{ id: "ABC", point: "Choose an implementation", adrId: "registered" },
+			{ id: "XYZ", point: "Confirm rollout" },
+		];
+		expect(completeDecisionCommandArguments("edit-adr ", items)).toBeNull();
+		expect(completeDecisionCommandArguments("promote ", items)?.map((item) => item.value)).toEqual(["promote XYZ"]);
+		expect(completeDecisionCommandArguments("promote XYZ --", items)?.map((item) => item.value)).toEqual(["promote XYZ --slug ", "promote XYZ --repo "]);
+		expect(completeDecisionCommandArguments("promote --", items)).toBeNull();
+		expect(completeDecisionCommandArguments("promote XYZ --repo ", items)).toBeNull();
 	});
 
 	it("routes compact overviews through each Pi mode's available output", () => {
@@ -742,7 +787,7 @@ describe("formatting and command completion", () => {
 
 	it("exports empty and all-resolved ledgers", () => {
 		expect(formatDecisionExport(emptyLedgerState())).toContain("No decisions are present on this branch.");
-		const resolved = applyBatchUpdates(stateWithItems("ABC"), [{ id: "ABC", lifecycle: "resolved", record }]);
+		const resolved = resolveDecision(stateWithItems("ABC"), "ABC", record);
 		const markdown = formatDecisionExport(resolved);
 		expect(markdown).toContain("## Decision `ABC`");
 		expect(markdown).toContain("Lifecycle: **resolved**");
@@ -866,6 +911,7 @@ describe("extension lifecycle hooks", () => {
 			getLeafId: () => string | undefined;
 		};
 		navigateTree: ReturnType<typeof vi.fn>;
+		newSession: ReturnType<typeof vi.fn>;
 		isIdle: ReturnType<typeof vi.fn>;
 	}
 
@@ -874,6 +920,7 @@ describe("extension lifecycle hooks", () => {
 		const commands = new Map<string, { handler: (args: string, ctx: FakeContext) => Promise<void> }>();
 		let tool: any;
 		let entries: object[] = [];
+		let branchEntries: object[] = entries;
 		let leafId: string | undefined = "tool-call";
 		let appendedEntryNumber = 0;
 		const pi: any = {
@@ -884,6 +931,7 @@ describe("extension lifecycle hooks", () => {
 			appendEntry: vi.fn((customType: string, data: unknown) => {
 				const entry = { type: "custom", id: `extension-${appendedEntryNumber++}`, customType, data };
 				entries = [...entries, entry];
+				branchEntries = [...branchEntries, entry];
 				leafId = entry.id;
 			}),
 			setLabel: vi.fn(),
@@ -897,6 +945,7 @@ describe("extension lifecycle hooks", () => {
 					details: message.details,
 				};
 				entries = [...entries, entry];
+				branchEntries = [...branchEntries, entry];
 				leafId = entry.id;
 			}),
 			sendUserMessage: vi.fn(),
@@ -920,13 +969,30 @@ describe("extension lifecycle hooks", () => {
 				custom: vi.fn(),
 			},
 			sessionManager: {
-				getBranch: () => entries,
+				getBranch: () => branchEntries,
 				getEntries: () => entries,
 				getLeafId: () => leafId,
 			},
 			navigateTree: vi.fn(async () => ({ cancelled: false })),
+			newSession: vi.fn(),
 			isIdle: vi.fn(() => true),
 		};
+		context.newSession.mockImplementation(async (options: any = {}) => {
+			const destinationEntries: object[] = [];
+			const destinationManager = {
+				appendCustomEntry: (customType: string, data: unknown) => {
+					const entry = { type: "custom", id: `new-session-${destinationEntries.length}`, customType, data };
+					destinationEntries.push(entry);
+					return entry.id;
+				},
+			};
+			await options.setup?.(destinationManager);
+			entries = destinationEntries;
+			branchEntries = destinationEntries;
+			leafId = (destinationEntries.at(-1) as { id?: string } | undefined)?.id;
+			await options.withSession?.(context);
+			return { cancelled: false };
+		});
 		decisionLedgerExtension(pi);
 		return {
 			handlers,
@@ -935,7 +1001,8 @@ describe("extension lifecycle hooks", () => {
 			pi,
 			context,
 			getEntries: () => entries,
-			setEntries: (next: object[]) => { entries = next; },
+			setEntries: (next: object[]) => { entries = next; branchEntries = next; },
+			setBranch: (next: object[]) => { branchEntries = next; },
 			setLeaf: (next: string | undefined) => { leafId = next; },
 		};
 	}
@@ -948,6 +1015,13 @@ describe("extension lifecycle hooks", () => {
 		expect(itemSchema.properties.lifecycle.description).toContain("user supplied or accepted");
 		expect(itemSchema.properties.record.description).toContain("forbidden for open");
 		expect(itemSchema.required).toEqual(["title", "point"]);
+		expect(fake.tool.parameters.properties.action.enum).toEqual([
+			"list", "detail", "add", "update", "explore", "propose", "resolve", "accept", "reject", "defer", "ignore", "reopen", "remove", "promote_adr",
+		]);
+		const updateSchema = fake.tool.parameters.properties.updates.items;
+		expect(Object.keys(updateSchema.properties)).toEqual(["id", "title", "point"]);
+		expect(updateSchema.properties.lifecycle).toBeUndefined();
+		expect(updateSchema.properties.record).toBeUndefined();
 	});
 
 	it("reports every added item's initial lifecycle concisely and atomically", async () => {
@@ -988,7 +1062,8 @@ describe("extension lifecycle hooks", () => {
 		const added = await fake.tool.execute("call", { action: "add", items: [{ point: "Choose an approach" }] }, undefined, undefined, fake.context);
 		const id = added.details.state.ledger.items[0].id;
 		const explored = await fake.tool.execute("call", { action: "explore", id }, undefined, undefined, fake.context);
-		expect(explored.details.state.ledger.items[0].lifecycle).toBe("exploring");
+		expect(explored.details.state.ledger.items[0].lifecycle).toBe("open");
+		expect(explored.details.state.ledger.items[0].exploration).toBeDefined();
 
 		const focused = await fake.handlers.get("before_agent_start")!({ systemPrompt: "base" }, fake.context) as { systemPrompt: string };
 		expect(focused.systemPrompt).toContain(`[Decision focus: \`${id}\`]`);
@@ -1000,7 +1075,7 @@ describe("extension lifecycle hooks", () => {
 		expect(branchUnfocused).toBeUndefined();
 
 		const proposed = proposeDecisionRecord(explored.details.state, id, record, "draft");
-		const resolved = resolveDecisionRecord(proposed, id, record);
+		const resolved = finalizeExploredProposal(proposed, id, record);
 		fake.setEntries([toolEntry("resolved", resolved)]);
 		await fake.handlers.get("session_tree")!({}, fake.context);
 		const resolvedUnfocused = await fake.handlers.get("before_agent_start")!({ systemPrompt: "base" }, fake.context);
@@ -1013,8 +1088,8 @@ describe("extension lifecycle hooks", () => {
 		const id = added.details.state.ledger.items[0].id;
 		await fake.tool.execute("call", { action: "propose", id, record }, undefined, undefined, fake.context);
 		const resolved = await fake.tool.execute("call", {
-			action: "update",
-			updates: [{ id, lifecycle: "resolved" }],
+			action: "accept",
+			id,
 		}, undefined, undefined, fake.context);
 		expect(resolved.content[0].text).toBe(`Decision \`${id}\` resolved: Use the narrow API.`);
 	});
@@ -1030,6 +1105,33 @@ describe("extension lifecycle hooks", () => {
 
 		expect(updated.content[0].text).toBe(`Updated \`${id}\`.`);
 		expect(updated.details.updatedIds).toEqual([id]);
+	});
+
+	it("renders the proposal produced by the current tool call", async () => {
+		const fake = makeFakeExtension();
+		const added = await fake.tool.execute("call", {
+			action: "add",
+			items: [
+				{ title: "First", point: "First proposal" },
+				{ title: "Second", point: "Second proposal" },
+			],
+		}, undefined, undefined, fake.context);
+		const [firstId, secondId] = added.details.state.ledger.items.map((item: { id: string }) => item.id);
+		await fake.tool.execute("call", {
+			action: "propose",
+			id: firstId,
+			record: { ...record, decision: "Choose the first proposal." },
+		}, undefined, undefined, fake.context);
+		const second = await fake.tool.execute("call", {
+			action: "propose",
+			id: secondId,
+			record: { ...record, decision: "Choose the second proposal." },
+		}, undefined, undefined, fake.context);
+
+		expect(second.details.updatedIds).toEqual([secondId]);
+		const rendered = fake.tool.renderResult(second, { expanded: true }, fake.context.ui.theme).render(200).join("\n");
+		expect(rendered).toContain("Choose the second proposal.");
+		expect(rendered).not.toContain("Choose the first proposal.");
 	});
 
 	it("requires an explicit user request for agent removal", async () => {
@@ -1101,8 +1203,8 @@ describe("extension lifecycle hooks", () => {
 		}, undefined, undefined, fake.context);
 		const [ignoredId, selectedId] = added.details.state.ledger.items.map((item: { id: string }) => item.id);
 		await fake.tool.execute("call", {
-			action: "update",
-			updates: [{ id: ignoredId, lifecycle: "ignored" }],
+			action: "ignore",
+			id: ignoredId,
 		}, undefined, undefined, fake.context);
 
 		const ansi: Record<string, string> = {
@@ -1184,11 +1286,9 @@ describe("extension lifecycle hooks", () => {
 			items: [{ point: "Open" }, { point: "Resolved" }, { point: "Ignored" }, { point: "Deferred" }],
 		}, undefined, undefined, fake.context);
 		const ids = added.details.state.ledger.items.map((item: { id: string }) => item.id);
-		await fake.tool.execute("call", { action: "update", updates: [
-			{ id: ids[1], lifecycle: "resolved" },
-			{ id: ids[2], lifecycle: "ignored" },
-			{ id: ids[3], lifecycle: "deferred" },
-		] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "resolve", id: ids[1], record }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "ignore", id: ids[2] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "defer", id: ids[3] }, undefined, undefined, fake.context);
 		const renderWidget = (): string[] => {
 			const factory = fake.context.ui.setWidget.mock.calls.at(-1)?.[1] as (tui: unknown, theme: unknown) => { render: (width: number) => string[] };
 			return factory({}, fake.context.ui.theme).render(80);
@@ -1200,13 +1300,171 @@ describe("extension lifecycle hooks", () => {
 		expect(lines.join("\\n")).not.toContain(ids[2]);
 		expect(lines.join("\\n")).not.toContain(ids[3]);
 
-		await fake.tool.execute("call", { action: "update", updates: [{ id: ids[0], lifecycle: "ignored" }] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "ignore", id: ids[0] }, undefined, undefined, fake.context);
 		lines = renderWidget();
 		expect(lines[0]).toBe("<accent>Decisions: 3/4 completed</accent>");
-		await fake.tool.execute("call", { action: "update", updates: [{ id: ids[3], lifecycle: "open" }] }, undefined, undefined, fake.context);
-		await fake.tool.execute("call", { action: "update", updates: [{ id: ids[3], lifecycle: "ignored" }] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "reopen", id: ids[3] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "ignore", id: ids[3] }, undefined, undefined, fake.context);
 		lines = renderWidget();
 		expect(lines).toEqual(["<success>Decisions: 4/4 completed</success>"]);
+	});
+
+	it("starts a fresh session carrying only the active branch ledger", async () => {
+		const active = stateWithItems("ABC", "XYZ");
+		const current = customEntry("current", active);
+		const offBranch = customEntry("off-branch", stateWithItems("QRS"));
+		const fake = makeFakeExtension();
+		fake.setEntries([current, offBranch]);
+		fake.setBranch([current]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+
+		await fake.commands.get("decisions")!.handler("new", fake.context);
+
+		expect(fake.context.newSession).toHaveBeenCalledOnce();
+		expect(fake.getEntries()).toHaveLength(1);
+		expect((fake.getEntries()[0] as any).data.source).toBe("session_handoff");
+		expect(replayLedgerBranch(fake.context.sessionManager.getBranch(), fake.getEntries())).toEqual(active);
+		expect(fake.context.ui.notify).toHaveBeenCalledWith("Started a new session with 2 decision(s).", "info");
+	});
+
+	it("does not start a ledger-aware session without an active ledger", async () => {
+		const fake = makeFakeExtension();
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+
+		await fake.commands.get("decisions")!.handler("new", fake.context);
+
+		expect(fake.context.newSession).not.toHaveBeenCalled();
+		expect(fake.context.ui.notify).toHaveBeenCalledWith(
+			"There is no active decision ledger to carry into a new session.",
+			"warning",
+		);
+	});
+
+	it("refuses to carry an active exploration whose return bookmark belongs to the old session", async () => {
+		const focused = startExploration(stateWithItems("ABC"), "ABC", "return-entry", "decision-return-ABC");
+		const fake = makeFakeExtension();
+		fake.setEntries([customEntry("focused", focused)]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+
+		await fake.commands.get("decisions")!.handler("new", fake.context);
+
+		expect(fake.context.newSession).not.toHaveBeenCalled();
+		expect(fake.context.ui.notify).toHaveBeenCalledWith(
+			"Finish or exit exploration <accent>[ABC]</accent> before starting a new session.",
+			"warning",
+		);
+	});
+
+	it("leaves the current session untouched when ledger-aware session creation is cancelled", async () => {
+		const current = customEntry("current", stateWithItems("ABC"));
+		const fake = makeFakeExtension();
+		fake.setEntries([current]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+		fake.context.newSession.mockResolvedValueOnce({ cancelled: true });
+
+		await fake.commands.get("decisions")!.handler("new", fake.context);
+
+		expect(fake.getEntries()).toEqual([current]);
+		expect(fake.context.ui.notify).toHaveBeenCalledWith("New session cancelled.", "info");
+	});
+
+	it("replaces an existing ledger only after confirmed recovery and persists the replacement", async () => {
+		const current = customEntry("current", stateWithItems("ABC"));
+		const recovered = customEntry("off-branch", stateWithItems("XYZ", "QRS"));
+		const fake = makeFakeExtension();
+		fake.setEntries([current, recovered]);
+		fake.setBranch([current]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+		fake.context.ui.confirm.mockResolvedValue(true);
+
+		await fake.commands.get("decisions")!.handler("recover", fake.context);
+
+		expect(fake.context.ui.confirm).toHaveBeenCalledWith(
+			"Recover decision ledger?",
+			expect.stringContaining("Completely replace/overwrite the current branch ledger (1 item(s))"),
+		);
+		expect(fake.context.ui.confirm.mock.calls[0][1]).toContain("with the 2-item snapshot");
+		expect(fake.context.ui.confirm.mock.calls[0][1]).toContain("will not merge");
+		const replayed = replayLedgerBranch(fake.context.sessionManager.getBranch(), fake.getEntries());
+		expect(replayed).toEqual(stateWithItems("XYZ", "QRS"));
+		expect(fake.context.ui.setWidget).toHaveBeenCalled();
+		expect(fake.getEntries()).toHaveLength(3);
+	});
+
+	it("cancels recovery without changing the current branch ledger", async () => {
+		const current = customEntry("current", stateWithItems("ABC"));
+		const recovered = customEntry("off-branch", stateWithItems("XYZ"));
+		const fake = makeFakeExtension();
+		fake.setEntries([current, recovered]);
+		fake.setBranch([current]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+		fake.context.ui.confirm.mockResolvedValue(false);
+
+		await fake.commands.get("decisions")!.handler("recover", fake.context);
+
+		expect(replayLedgerBranch(fake.context.sessionManager.getBranch(), fake.getEntries())).toEqual(stateWithItems("ABC"));
+		expect(fake.getEntries()).toHaveLength(2);
+		expect(fake.context.ui.notify).toHaveBeenCalledWith("Recovery cancelled.", "info");
+	});
+
+	it("leaves the current ledger unchanged when there is no off-branch candidate", async () => {
+		const current = customEntry("current", stateWithItems("ABC"));
+		const fake = makeFakeExtension();
+		fake.setEntries([current]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+
+		await fake.commands.get("decisions")!.handler("recover", fake.context);
+
+		expect(fake.context.ui.confirm).not.toHaveBeenCalled();
+		expect(replayLedgerBranch(fake.context.sessionManager.getBranch(), fake.getEntries())).toEqual(stateWithItems("ABC"));
+		expect(fake.context.ui.notify).toHaveBeenCalledWith("No off-branch decision ledger snapshot was found.", "info");
+	});
+
+	it("refuses recovery without interactive UI confirmation", async () => {
+		const current = customEntry("current", stateWithItems("ABC"));
+		const recovered = customEntry("off-branch", stateWithItems("XYZ"));
+		const fake = makeFakeExtension("print");
+		fake.setEntries([current, recovered]);
+		fake.setBranch([current]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+
+		await fake.commands.get("decisions")!.handler("recover", fake.context);
+
+		expect(fake.context.ui.confirm).not.toHaveBeenCalled();
+		expect(fake.getEntries()).toHaveLength(2);
+		expect(replayLedgerBranch(fake.context.sessionManager.getBranch(), fake.getEntries())).toEqual(stateWithItems("ABC"));
+	});
+
+	it("recovers into an empty current branch", async () => {
+		const recovered = customEntry("off-branch", stateWithItems("XYZ"));
+		const fake = makeFakeExtension();
+		fake.setEntries([recovered]);
+		fake.setBranch([]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+		fake.context.ui.confirm.mockResolvedValue(true);
+
+		await fake.commands.get("decisions")!.handler("recover", fake.context);
+
+		expect(replayLedgerBranch(fake.context.sessionManager.getBranch(), fake.getEntries())).toEqual(stateWithItems("XYZ"));
+	});
+
+	it("replays a recovery snapshot after replacement without changing earlier snapshots", async () => {
+		const currentState = stateWithItems("ABC");
+		const recoveredState = stateWithItems("XYZ");
+		const current = customEntry("current", currentState);
+		const recovered = customEntry("off-branch", recoveredState);
+		const fake = makeFakeExtension();
+		fake.setEntries([current, recovered]);
+		fake.setBranch([current]);
+		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
+		fake.context.ui.confirm.mockResolvedValue(true);
+
+		await fake.commands.get("decisions")!.handler("recover", fake.context);
+		const recovery = fake.getEntries().at(-1)!;
+		expect((recovery as any).data.source).toBe("recovery");
+		expect(replayLedgerBranch([current], fake.getEntries())).toEqual(currentState);
+		expect(replayLedgerBranch(fake.context.sessionManager.getBranch(), fake.getEntries())).toEqual(recoveredState);
+		expect(recoveredState).toEqual(stateWithItems("XYZ"));
 	});
 
 	it("handles selector shortcuts, confirmation cancellation, invalid actions, and delete encoding", async () => {
@@ -1271,11 +1529,9 @@ describe("extension lifecycle hooks", () => {
 			items: [{ point: "Ignored" }, { point: "Open" }, { point: "Deferred" }, { point: "Resolved" }],
 		}, undefined, undefined, fake.context);
 		const ids = added.details.state.ledger.items.map((item: { id: string }) => item.id);
-		await fake.tool.execute("call", { action: "update", updates: [
-			{ id: ids[0], lifecycle: "ignored" },
-			{ id: ids[2], lifecycle: "deferred" },
-			{ id: ids[3], lifecycle: "resolved" },
-		] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "ignore", id: ids[0] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "defer", id: ids[2] }, undefined, undefined, fake.context);
+		await fake.tool.execute("call", { action: "resolve", id: ids[3], record }, undefined, undefined, fake.context);
 		let component: { render: (width: number) => string[] } | undefined;
 		fake.context.ui.custom.mockImplementation(async (factory: any) => {
 			component = factory({ requestRender: vi.fn() }, fake.context.ui.theme, {}, vi.fn());
@@ -1303,9 +1559,12 @@ describe("extension lifecycle hooks", () => {
 			await command;
 		};
 
+		fake.context.ui.notify.mockClear();
 		await press("e");
+		expect(fake.context.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Exploring"), "warning");
 		let listed = await fake.tool.execute("call", { action: "list" }, undefined, undefined, fake.context);
-		expect(listed.details.state.ledger.items[0].lifecycle).toBe("exploring");
+		expect(listed.details.state.ledger.items[0].lifecycle).toBe("open");
+		expect(listed.details.state.ledger.items[0].exploration).toBeDefined();
 		await fake.commands.get("decision")!.handler("exit", fake.context);
 		await press("f");
 		listed = await fake.tool.execute("call", { action: "list" }, undefined, undefined, fake.context);
@@ -1322,7 +1581,8 @@ describe("extension lifecycle hooks", () => {
 		await lightweight.tool.execute("call", { action: "propose", id, record }, undefined, undefined, lightweight.context);
 		lightweight.context.ui.confirm.mockResolvedValue(true);
 		let component: { handleInput: (data: string) => void } | undefined;
-		lightweight.context.ui.custom.mockImplementation(async (factory: any) => new Promise((resolve) => {
+		lightweight.context.ui.custom.mockResolvedValue(null);
+		lightweight.context.ui.custom.mockImplementationOnce(async (factory: any) => new Promise((resolve) => {
 			component = factory({ requestRender: vi.fn() }, lightweight.context.ui.theme, {}, resolve);
 		}));
 		const command = lightweight.commands.get("decisions")!.handler("", lightweight.context);
@@ -1342,7 +1602,8 @@ describe("extension lifecycle hooks", () => {
 		explored.context.ui.confirm.mockResolvedValue(true);
 		explored.context.ui.editor.mockResolvedValue(renderDecisionRecordMarkdown({ id: exploredId, point: "Investigate" }, record));
 		let exploredComponent: { handleInput: (data: string) => void } | undefined;
-		explored.context.ui.custom.mockImplementation(async (factory: any) => new Promise((resolve) => {
+		explored.context.ui.custom.mockResolvedValue(null);
+		explored.context.ui.custom.mockImplementationOnce(async (factory: any) => new Promise((resolve) => {
 			exploredComponent = factory({ requestRender: vi.fn() }, explored.context.ui.theme, {}, resolve);
 		}));
 		const exploredCommand = explored.commands.get("decisions")!.handler("", explored.context);
@@ -1376,7 +1637,8 @@ describe("extension lifecycle hooks", () => {
 		await fake.commands.get("decision")!.handler("return", fake.context);
 		expect(fake.context.ui.editor).toHaveBeenCalledWith(`Review decision record [${idA}]`, markdownA);
 		const cancelled = await fake.tool.execute("call", { action: "list" }, undefined, undefined, fake.context);
-		expect(cancelled.details.state.ledger.items.find((item: { id: string }) => item.id === idA)?.lifecycle).toBe("exploring");
+		expect(cancelled.details.state.ledger.items.find((item: { id: string }) => item.id === idA)?.lifecycle).toBe("proposed");
+		expect(cancelled.details.state.ledger.items.find((item: { id: string }) => item.id === idA)?.exploration).toBeDefined();
 
 		await fake.commands.get("decision")!.handler("return", fake.context);
 		const resolved = await fake.tool.execute("call", { action: "list" }, undefined, undefined, fake.context);
@@ -1453,7 +1715,7 @@ describe("extension lifecycle hooks", () => {
 			returnLabel: `decision-return-${id}`,
 			origin: "open",
 		});
-		expect(replayed.details.state.proposal).toEqual({ itemId: id, record, markdown });
+		expect(getDecisionProposal(replayed.details.state, id)).toEqual({ itemId: id, record, markdown });
 
 		// Recreate the extension from the actual recorded entries as reload does.
 		const reloaded = makeFakeExtension();
@@ -1465,7 +1727,7 @@ describe("extension lifecycle hooks", () => {
 		expect(restoredItem.proposalMarkdown).toBe(markdown);
 		expect(restoredItem.exploration?.origin).toBe("open");
 		expect(restoredItem.exploration?.returnLabel).toBe(`decision-return-${id}`);
-		expect(restored.details.state.proposal?.markdown).toBe(markdown);
+		expect(getDecisionProposal(restored.details.state, id)?.markdown).toBe(markdown);
 	});
 
 	it("uses the native follow-up loader path and cleans it on settlement", async () => {
@@ -1552,7 +1814,9 @@ describe("extension lifecycle hooks", () => {
 			{ title: "Second choice", point: "Investigate second choice fully" },
 		] }, undefined, undefined, fake.context);
 		const [firstId, secondId] = added.details.state.ledger.items.map((item: { id: string }) => item.id);
-		await fake.tool.execute("call", { action: "explore", id: firstId }, undefined, undefined, fake.context);
+		fake.context.ui.notify.mockClear();
+		await fake.commands.get("decision")!.handler(`explore ${firstId}`, fake.context);
+		expect(fake.context.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Exploring"), "warning");
 		const started = fake.pi.sendMessage.mock.calls.filter(([message]: [any]) => message.customType === FOCUS_TRANSITION_MESSAGE_TYPE);
 		expect(started).toHaveLength(1);
 		expect(started[0]![0].content).toContain("`" + firstId + "`");
@@ -1573,7 +1837,9 @@ describe("extension lifecycle hooks", () => {
 		expect(firstMarkers[0].content).toContain("this, it, the decision, and the proposal");
 		expect(firstMarkers[0].content).toContain("recently resolved decision does not regain focus");
 
+		fake.context.ui.notify.mockClear();
 		await fake.commands.get("decision")!.handler(`explore ${secondId}`, fake.context);
+		expect(fake.context.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Exploring"), "warning");
 		const transitions = fake.pi.sendMessage.mock.calls.filter(([message]: [any]) => message.customType === FOCUS_TRANSITION_MESSAGE_TYPE);
 		expect(transitions).toHaveLength(2);
 		expect(transitions[1]![0].content).toContain("`" + secondId + "`");
@@ -1597,11 +1863,25 @@ describe("extension lifecycle hooks", () => {
 			shouldTriggerFileCompletion: vi.fn(() => true),
 		};
 		addAutocompleteProvider.mockImplementation((factory: any) => factory(base));
-		const snapshot: LedgerState = { ledger: { items: [
-			{ id: "ABC", title: "Choose API", point: "Choose an API", lifecycle: "open" },
-			{ id: "D1", title: "Legacy choice", point: "Choose legacy", lifecycle: "open" },
-			{ id: "XYZ", title: "Confirm rollout", point: "Confirm rollout", lifecycle: "open" },
-		] } };
+		const adr = createDurableAdrFromBody("# Use repository ADRs\n\n## Context and Problem Statement\n\nDecisions need persistence.\n\n## Considered Options\n\n- Session state\n- Repository ADRs\n\n## Decision Outcome\n\nUse repository ADRs.\n\n### Consequences\n\n- Decisions persist.\n");
+		const snapshot: LedgerState = {
+			ledger: { items: [
+				{ id: "ABC", title: "Choose API", point: "Choose an API", lifecycle: "open" },
+				{ id: "D1", title: "Legacy choice", point: "Choose legacy", lifecycle: "open" },
+				{ id: "XYZ", title: "Confirm rollout", point: "Confirm rollout", lifecycle: "open" },
+			] },
+			adrs: [{
+				adrId: adr.id,
+				slug: "repository-backed-adrs",
+				lifecycle: adr.lifecycle,
+				repositoryRoot: "/repo",
+				relativePath: "decisions/repository-backed-adrs.md",
+				baseSemanticDigest: adr.semanticDigest,
+				baseSourceFingerprint: adr.sourceFingerprint,
+				baseSource: adr.source,
+				sourceDecisionIds: ["ABC"],
+			}],
+		};
 		fake.setEntries([customEntry("state", snapshot)]);
 		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
 		await fake.handlers.get("session_start")!({ reason: "reload" }, fake.context);
@@ -1620,9 +1900,18 @@ describe("extension lifecycle hooks", () => {
 		const removeIds = await wrapper.getSuggestions(["/decision remove ABC "], 0, 21, { force: true, signal });
 		expect(removeIds?.items.map((item: any) => item.value)).toEqual(["D1", "XYZ"]);
 		expect(await wrapper.getSuggestions(["/decision explore Q"], 0, 20, { force: true, signal })).toBeNull();
-		expect(wrapper.shouldTriggerFileCompletion(["/decision explore "], 0, 19)).toBe(false);
+		const flag = await wrapper.getSuggestions(["/decision promote ABC --"], 0, 24, { force: true, signal });
+		expect(flag?.items.map((item: any) => item.value)).toEqual(["--slug", "--repo"]);
+		expect(await wrapper.getSuggestions(["/decision edit-adr "], 0, 19, { force: true, signal })).toBeNull();
+		const adrSlugs = await wrapper.getSuggestions(["/adr accept "], 0, 12, { force: true, signal });
+		expect(adrSlugs?.items.map((item: any) => item.value)).toEqual(["repository-backed-adrs"]);
+		expect(wrapper.shouldTriggerFileCompletion(["/adr accept "], 0, 12)).toBe(true);
+		expect(base.getSuggestions).not.toHaveBeenCalledWith(["/adr accept "], 0, 12, expect.anything());
+		expect(wrapper.shouldTriggerFileCompletion(["/decision explore "], 0, 19)).toBe(true);
 		const applied = wrapper.applyCompletion(["/decision explore d"], 0, 19, { value: "D1", label: "[D1]" }, "d");
 		expect(applied.lines[0]).toBe("/decision explore D1");
+		const appliedAdr = wrapper.applyCompletion(["/adr accept "], 0, 12, { value: "repository-backed-adrs", label: "repository-backed-adrs" }, "");
+		expect(appliedAdr.lines[0]).toBe("/adr accept repository-backed-adrs");
 		await wrapper.getSuggestions(["./"], 0, 2, { force: true, signal });
 		expect(wrapper.shouldTriggerFileCompletion(["./"], 0, 2)).toBe(true);
 		expect(base.getSuggestions).toHaveBeenCalled();
