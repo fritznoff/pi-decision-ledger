@@ -1068,6 +1068,11 @@ describe("extension lifecycle hooks", () => {
 		const focused = await fake.handlers.get("before_agent_start")!({ systemPrompt: "base" }, fake.context) as { systemPrompt: string };
 		expect(focused.systemPrompt).toContain(`[Decision focus: \`${id}\`]`);
 		expect(focused.systemPrompt).toContain("do not reject unrelated prompts");
+		expect(focused.systemPrompt).toContain("exactly one main thought");
+		expect(focused.systemPrompt).toContain("short, linear sequence using plain language");
+		expect(focused.systemPrompt).toContain("concrete scenario or example");
+		expect(focused.systemPrompt).toContain("leave the next thought for another turn");
+		expect(focused.systemPrompt).toContain("stop so the user can respond");
 
 		fake.setEntries([customEntry("other-branch", emptyLedgerState())]);
 		await fake.handlers.get("session_tree")!({}, fake.context);
@@ -1836,6 +1841,9 @@ describe("extension lifecycle hooks", () => {
 		expect(firstMarkers[0].content).toContain("Investigate first choice fully");
 		expect(firstMarkers[0].content).toContain("this, it, the decision, and the proposal");
 		expect(firstMarkers[0].content).toContain("recently resolved decision does not regain focus");
+		expect(firstMarkers[0].content).toContain("exactly one main thought");
+		expect(firstMarkers[0].content).toContain("concrete scenario or example");
+		expect(firstMarkers[0].content).toContain("stop so the user can respond");
 
 		fake.context.ui.notify.mockClear();
 		await fake.commands.get("decision")!.handler(`explore ${secondId}`, fake.context);

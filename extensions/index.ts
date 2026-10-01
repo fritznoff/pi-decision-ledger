@@ -542,12 +542,21 @@ function focusTransitionContent(kind: FocusTransitionKind, item: DecisionItem): 
 	}
 }
 
+const EXPLORATION_TURN_GUIDANCE = [
+	"Each user-visible response must advance exactly one main thought about the active decision.",
+	"Explain that thought in a short, linear sequence using plain language.",
+	"Do not bundle in a second issue, conclusion, or next step; leave the next thought for another turn.",
+	"When it improves understanding, ground the thought in a concrete scenario or example.",
+	"Finish that thought, then stop so the user can respond.",
+].join(" ");
+
 function focusMarkerContent(item: DecisionItem): string {
 	return [
 		`Active decision focus: ${formatDecisionId(item.id)} — ${decisionDisplayTitle(item)}.`,
 		`Full point: ${item.point}`,
 		"Ambiguous references such as this, it, the decision, and the proposal refer to the active decision unless the current user message explicitly identifies another subject.",
 		"A recently resolved decision does not regain focus.",
+		EXPLORATION_TURN_GUIDANCE,
 	].join(" ");
 }
 
@@ -1108,7 +1117,7 @@ export default function decisionLedgerExtension(pi: ExtensionAPI): void {
 		const focused = getFocusedExploration(state);
 		if (focused === undefined) return;
 		return {
-			systemPrompt: `${event.systemPrompt}\n\n[Decision focus: ${formatDecisionId(focused.id)}]\nActive decision: ${focused.point}\nFocus rule: Keep the work centered on this decision. Do not finalize or switch decisions unless the user explicitly asks. Honor explicit requests to switch or exit exploration; do not reject unrelated prompts.`,
+			systemPrompt: `${event.systemPrompt}\n\n[Decision focus: ${formatDecisionId(focused.id)}]\nActive decision: ${focused.point}\nFocus rule: Keep the work centered on this decision. Do not finalize or switch decisions unless the user explicitly asks. Honor explicit requests to switch or exit exploration; do not reject unrelated prompts.\nExploration response rule: ${EXPLORATION_TURN_GUIDANCE}`,
 		};
 	});
 
