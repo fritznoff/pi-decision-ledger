@@ -7,13 +7,13 @@ A deliberately small Pi package for tracking user-resolvable decisions in the ac
 From a local checkout:
 
 ```bash
-pi install git:github.com/fritznoff/pi-decision-ledger@v0.6.0
+pi install git:github.com/fritznoff/pi-decision-ledger@v0.6.1
 ```
 
 For a one-off test:
 
 ```bash
-pi -e git:github.com/fritznoff/pi-decision-ledger@v0.6.0
+pi -e git:github.com/fritznoff/pi-decision-ledger@v0.6.1
 ```
 
 The package provides one extension, the `decision_ledger` agent tool, the bundled `decision-ledger` Agent Skill, a separate durable ADR core in `src/durable.ts`, and repository-backed durable access in `src/durable-repository.ts`.

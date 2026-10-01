@@ -1,6 +1,6 @@
 {
   "name": "pi-decision-ledger",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "A small session- and branch-scoped decision ledger for Pi.",
   "type": "module",
   "keywords": ["pi-package"],
